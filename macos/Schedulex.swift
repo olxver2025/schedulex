@@ -28,6 +28,8 @@ struct ScheduledJob: Codable, Identifiable, Sendable {
     let window: String?
     let timezone: String?
     let runs: String
+    let model: String?
+    let effort: String?
 }
 
 struct UsageWindow: Codable, Identifiable, Sendable {
@@ -61,7 +63,67 @@ struct Dashboard: Codable, Sendable {
     let usageError: String?
 }
 
+struct TaskDraft: Sendable {
+    let prompt: String
+    let workspace: String
+    let date: Date
+    let afterReset: Bool
+    let allowEdits: Bool
+    let overnight: Bool
+    let idleOnly: Bool
+    let model: String
+    let effort: String
+
+    func arguments(promptFile: String) throws -> [String] {
+        guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw NSError(domain: "Schedulex", code: 1, userInfo: [NSLocalizedDescriptionKey: "Enter a task prompt."])
+        }
+        let path = (workspace as NSString).expandingTildeInPath
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw NSError(domain: "Schedulex", code: 1, userInfo: [NSLocalizedDescriptionKey: "Choose an existing workspace folder."])
+        }
+        if !afterReset && date <= Date() {
+            throw NSError(domain: "Schedulex", code: 1, userInfo: [NSLocalizedDescriptionKey: "Choose a future date and time."])
+        }
+        var args = ["add", "--prompt-file", promptFile, "--cwd", path,
+                    "--sandbox", allowEdits ? "workspace-write" : "read-only"]
+        args += afterReset ? ["--after-reset"] : ["--at", ISO8601DateFormatter().string(from: date)]
+        if overnight { args += ["--window", "23:00-07:00", "--timezone", TimeZone.current.identifier] }
+        if idleOnly { args += ["--idle-minutes", "15"] }
+        let selectedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        let selectedEffort = effort.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !selectedModel.isEmpty { args += ["--model", selectedModel] }
+        if !selectedEffort.isEmpty { args += ["--effort", selectedEffort] }
+        return args
+    }
+}
+
+struct ModelOption: Codable, Identifiable, Sendable {
+    let id: String
+    let name: String
+    let efforts: [String]
+    let defaultEffort: String?
+}
+
+struct ModelCatalog: Codable, Sendable {
+    let models: [ModelOption]
+    let defaultModel: String?
+    let defaultEffort: String?
+}
+
 enum Bridge {
+    static func queue(_ config: Configuration, _ draft: TaskDraft) throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("schedulex-prompt-\(UUID().uuidString).txt")
+        let args = try draft.arguments(promptFile: file.path)
+        guard FileManager.default.createFile(atPath: file.path, contents: Data(draft.prompt.utf8),
+                                            attributes: [.posixPermissions: 0o600]) else {
+            throw NSError(domain: "Schedulex", code: 1, userInfo: [NSLocalizedDescriptionKey: "Could not save the prompt."])
+        }
+        defer { try? FileManager.default.removeItem(at: file) }
+        _ = try run(config, args)
+    }
+
     static func run(_ config: Configuration, _ args: [String]) throws -> Data {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: config.python)
@@ -94,6 +156,21 @@ final class MenuModel {
     var usageUpdated: Date?
     var error: String?
     var busy = false
+    var composing = false
+    var draftPrompt = ""
+    var draftWorkspace = FileManager.default.homeDirectoryForCurrentUser.path
+    var draftDate = Date().addingTimeInterval(3600)
+    var draftAfterReset = false
+    var draftAllowEdits = false
+    var draftOvernight = false
+    var draftIdleOnly = false
+    var draftModel = ""
+    var draftEffort = ""
+    var catalog: ModelCatalog?
+    var catalogError: String?
+    var loadingModels = false
+    var draftError: String?
+    var queuedMessage: String?
     private let config: Configuration?
 
     init() {
@@ -102,7 +179,7 @@ final class MenuModel {
     }
 
     func refresh() async {
-        guard !busy, let config else { return }
+        guard !busy, !composing, let config else { return }
         busy = true
         defer { busy = false }
         do {
@@ -133,6 +210,44 @@ final class MenuModel {
             self.error = error.localizedDescription
             busy = false
         }
+    }
+
+    func queueDraft() async {
+        guard !busy, let config else { return }
+        let draft = TaskDraft(prompt: draftPrompt, workspace: draftWorkspace, date: draftDate,
+                              afterReset: draftAfterReset, allowEdits: draftAllowEdits,
+                              overnight: draftOvernight, idleOnly: draftIdleOnly,
+                              model: draftModel, effort: draftEffort)
+        busy = true
+        draftError = nil
+        do {
+            try await Task.detached { try Bridge.queue(config, draft) }.value
+            draftPrompt = ""
+            composing = false
+            queuedMessage = "Task queued.\(dashboard?.workerRunning == true ? "" : " Start the worker to run it.")"
+            busy = false
+            await refresh()
+        } catch {
+            draftError = error.localizedDescription
+            busy = false
+        }
+    }
+
+    func loadModels() async {
+        guard !loadingModels, let config else { return }
+        loadingModels = true
+        defer { loadingModels = false }
+        do {
+            catalog = try await Task.detached {
+                try JSONDecoder().decode(ModelCatalog.self, from: Bridge.run(config, ["models"]))
+            }.value
+            catalogError = nil
+        } catch { catalogError = "Could not load model choices. You can enter a model and effort manually." }
+    }
+
+    var selectedModel: ModelOption? {
+        let name = draftModel.isEmpty ? catalog?.defaultModel : draftModel
+        return catalog?.models.first { $0.id == name }
     }
 }
 
@@ -185,6 +300,10 @@ struct JobView: View {
                     .foregroundStyle(job.status == "failed" || job.status == "interrupted" ? .orange : .secondary)
             }
             Text(dateLabel(job.due)).font(.caption).foregroundStyle(.secondary)
+            if job.model != nil || job.effort != nil {
+                Text("\(job.model ?? "Codex default model") · \(job.effort ?? "default") effort")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             if let window = job.window {
                 Text("Allowed hours \(window) · \(job.timezone ?? "")")
                     .font(.caption).foregroundStyle(.secondary)
@@ -211,6 +330,96 @@ struct JobView: View {
     }
 }
 
+struct TaskComposer: View {
+    @Bindable var model: MenuModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Queue a task").font(.headline)
+                Spacer()
+                Button("Back") { model.composing = false }.disabled(model.busy)
+            }
+            Text("Prompt").font(.subheadline).fontWeight(.medium)
+            TextEditor(text: $model.draftPrompt)
+                .font(.body).frame(height: 165).padding(4)
+                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(.quaternary))
+                .accessibilityLabel("Complete task prompt")
+            Text("Workspace").font(.subheadline).fontWeight(.medium)
+            HStack {
+                TextField("Folder path", text: $model.draftWorkspace)
+                    .textFieldStyle(.roundedBorder).accessibilityLabel("Workspace folder")
+                Button("Choose…") {
+                    let panel = NSOpenPanel()
+                    panel.canChooseDirectories = true
+                    panel.canChooseFiles = false
+                    panel.allowsMultipleSelection = false
+                    panel.prompt = "Choose workspace"
+                    panel.begin { response in
+                        if response == .OK, let url = panel.url { model.draftWorkspace = url.path }
+                    }
+                }
+            }
+            HStack {
+                Text("Model").frame(width: 50, alignment: .leading)
+                TextField(model.catalog?.defaultModel ?? "Codex default", text: $model.draftModel)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("Model override")
+                    .onChange(of: model.draftModel) { _, _ in model.draftEffort = "" }
+                Menu("Choose") {
+                    Button("Codex default") { model.draftModel = "" }
+                    ForEach(model.catalog?.models ?? []) { choice in
+                        Button(choice.name) { model.draftModel = choice.id }
+                    }
+                }.disabled(model.loadingModels)
+            }
+            HStack {
+                Text("Effort").frame(width: 50, alignment: .leading)
+                if let choice = model.selectedModel {
+                    Picker("Reasoning effort", selection: $model.draftEffort) {
+                        Text("Codex default").tag("")
+                        ForEach(choice.efforts, id: \.self) { effort in Text(effort.capitalized).tag(effort) }
+                    }.labelsHidden().frame(maxWidth: .infinity)
+                } else {
+                    TextField("Codex default (e.g. high)", text: $model.draftEffort)
+                        .textFieldStyle(.roundedBorder).accessibilityLabel("Reasoning effort override")
+                }
+                if model.loadingModels { ProgressView().controlSize(.small) }
+            }
+            if let message = model.catalogError {
+                Text(message).font(.caption).foregroundStyle(.secondary)
+            }
+            Picker("Schedule", selection: $model.draftAfterReset) {
+                Text("At a time").tag(false)
+                Text("After 5-hour reset").tag(true)
+            }.pickerStyle(.segmented)
+            if model.draftAfterReset {
+                Text("Uses your next reported reset time and waits for available allowance.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                DatePicker("Run at", selection: $model.draftDate, in: Date()...,
+                           displayedComponents: [.date, .hourAndMinute])
+                Text("Time zone: \(TimeZone.current.identifier)").font(.caption).foregroundStyle(.secondary)
+            }
+            Toggle("Allow edits in this workspace", isOn: $model.draftAllowEdits)
+            Toggle("Only start overnight (23:00–07:00)", isOn: $model.draftOvernight)
+            Toggle("Wait for 15 minutes of keyboard/mouse inactivity", isOn: $model.draftIdleOnly)
+            if let error = model.draftError {
+                Text(error).font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                if model.busy { ProgressView().controlSize(.small) }
+                Spacer()
+                Button("Queue task") { Task { await model.queueDraft() } }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.busy || model.draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }.padding(16).frame(width: 410).disabled(model.busy)
+            .task { await model.loadModels() }
+    }
+}
+
 struct MenuPanel: View {
     let model: MenuModel
     private var active: [ScheduledJob] {
@@ -221,6 +430,9 @@ struct MenuPanel: View {
     }
 
     var body: some View {
+        if model.composing {
+            TaskComposer(model: model)
+        } else {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Label("Schedulex", systemImage: "clock.badge.checkmark").font(.headline)
@@ -239,6 +451,13 @@ struct MenuPanel: View {
                     Task { await model.perform(["service", model.dashboard?.workerRunning == true ? "uninstall" : "install"]) }
                 }.disabled(model.busy).buttonStyle(.borderless)
             }.font(.caption)
+            Button { model.draftError = nil; model.queuedMessage = nil; model.composing = true } label: {
+                Label("Queue a task", systemImage: "plus")
+                    .frame(maxWidth: .infinity)
+            }.buttonStyle(.bordered).disabled(model.busy)
+            if let message = model.queuedMessage {
+                Text(message).font(.caption).foregroundStyle(.secondary)
+            }
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     if let usage = model.usage {
@@ -298,11 +517,10 @@ struct MenuPanel: View {
                 Spacer()
                 Button("Quit") { NSApplication.shared.terminate(nil) }
             }.buttonStyle(.borderless).font(.caption)
-            Text("Schedule in Terminal with schx add or schedulex add.")
-                .font(.caption).foregroundStyle(.secondary)
         }
         .padding(16).frame(width: 410)
         .task { await model.refresh() }
+        }
     }
 }
 

@@ -98,6 +98,39 @@ def snapshot(binary):
         server.close()
 
 
+def catalog(binary):
+    server = AppServer(binary)
+    try:
+        server.request("initialize", {"clientInfo": {"name": "schedulex", "title": "Schedulex", "version": "0.2.0"}})
+        server.send({"method": "initialized", "params": {}})
+        entries = []
+        cursor = None
+        seen = set()
+        while True:
+            params = {"limit": 100, "includeHidden": False}
+            if cursor:
+                params["cursor"] = cursor
+            result = server.request("model/list", params)
+            for model in result["data"]:
+                entries.append({"id": model["model"], "name": model["displayName"],
+                                "efforts": [e["reasoningEffort"] for e in model["supportedReasoningEfforts"]],
+                                "defaultEffort": model.get("defaultReasoningEffort")})
+            cursor = result.get("nextCursor")
+            if not cursor:
+                break
+            if cursor in seen or len(seen) >= 50:
+                raise CodexError("Model catalog pagination did not finish")
+            seen.add(cursor)
+        try:
+            config = server.request("config/read", {"includeLayers": False}).get("config", {})
+        except CodexError:
+            config = {}
+        return {"models": entries, "defaultModel": config.get("model"),
+                "defaultEffort": config.get("model_reasoning_effort")}
+    finally:
+        server.close()
+
+
 def bucket(snapshot_value, limit_id="codex"):
     limits = snapshot_value["limits"]
     buckets = limits.get("rateLimitsByLimitId")
@@ -142,5 +175,7 @@ def command(binary, job, output):
             "-c", 'model_provider="openai"', "-c", 'forced_login_method="chatgpt"']
     if job["model"]:
         args += ["--model", job["model"]]
+    if job.get("effort"):
+        args += ["-c", f"model_reasoning_effort={json.dumps(job['effort'])}"]
     args.append("-")
     return args

@@ -49,7 +49,8 @@ def dashboard(store, binary):
         jobs.append({"id": row["id"], "prompt": spec["prompt"], "status": row["status"],
                      "due": row["due"], "cwd": spec["cwd"], "note": row["note"],
                      "window": spec.get("window"), "timezone": spec.get("timezone"),
-                     "runs": str(store.root / "runs" / row["id"])})
+                     "runs": str(store.root / "runs" / row["id"]),
+                     "model": spec.get("model"), "effort": spec.get("effort")})
     result = {"jobs": jobs, "workerRunning": worker_running(store), "stateDir": str(store.root),
               "checkedAt": time.time(), "usage": None, "usageError": None}
     try:

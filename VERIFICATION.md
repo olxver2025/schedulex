@@ -50,3 +50,16 @@ persistent jobs being checked when the worker next runs; no automatic wake is of
   refresh pipeline were verified directly; the SwiftUI panel is rendered by a
   separate native preview harness. Visually inspected both the live usage panel and
   a panel with a sample queued task, including full-prompt copy, workspace, and cancel controls.
+
+## Menu bar composer and model/effort overrides, version 0.3.0
+
+- 33 Python tests pass. Explicit model/effort survive CLI enqueueing and are passed
+  to the Codex subprocess; unset effort leaves the existing Codex configuration alone.
+- Live `model/list` discovery verified the account's model slugs and each model's
+  supported reasoning efforts. `config/read` supplied configured defaults.
+- Compiled and ran native composer integration checks against fake Codex. The exact
+  bridge used by the UI saved a 190 KB multiline Unicode prompt without argument-size
+  limits, model/effort, edit permissions, idle/window gates, and reset scheduling.
+  Empty prompts were rejected; all temporary test jobs were cancelled.
+- Visually inspected the native composer render, including prompt editor, workspace
+  picker, model/effort controls, schedule modes, permission toggles, and queue action.

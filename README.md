@@ -24,7 +24,12 @@ subscription allowance, absolute reset times and countdowns, and the authoritati
 number of banked usage resets, including expiry dates when reported by Codex.
 It refreshes every minute and when opened. Failed reads show an error and label
 previous usage data as stale; unknown counts are shown as unavailable, not zero.
-Banked resets are never automatically consumed. You can cancel pending jobs, copy
+Banked resets are never automatically consumed. Click **Queue a task** to enter a
+complete prompt, choose a workspace, schedule a date/time or the next five-hour reset,
+and optionally restrict starts to overnight hours or 15 minutes of inactivity.
+Project edits require the **Allow edits in this workspace** toggle. A queued task
+appears in the task list; scheduling does not start a stopped worker automatically.
+You can cancel pending jobs, copy
 their complete prompt, open workspaces/results, or start/stop the worker there.
 Quitting the menu bar app leaves the worker running.
 
@@ -32,7 +37,20 @@ Quitting the menu bar app leaves the worker running.
 schx add --at +2h --prompt-file prompt.txt --sandbox workspace-write
 schedulex list
 schx menubar
+schx models
+schx add --at +2h --model gpt-6.1-sol --effort high --prompt-file prompt.txt
 ```
+
+Both the CLI and menu bar support per-task model and reasoning effort overrides.
+Use `--model` and `--effort` (alias `--reasoning-effort`) in the CLI. In the composer,
+choose a model from the live Codex catalog or enter its slug, then choose an effort.
+Available effort levels come from the selected model's reported capabilities. For
+a custom model or unavailable catalog, you can enter an effort manually. Changing
+models clears the previous effort selection. Leave model/effort blank or select
+**Codex default** to retain Codex configuration. Overrides are saved with each job
+and displayed on task cards. Unsupported custom combinations are handled by Codex
+at execution time. `schx models` lists live model capabilities and configured defaults.
+Drafts are retained while navigating back; successful queueing clears the prompt.
 
 To install without starting anything or changing your shell profile:
 

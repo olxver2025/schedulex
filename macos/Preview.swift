@@ -12,14 +12,24 @@ struct Preview {
         model.dashboard = value
         model.usage = value.usage
         model.error = value.usageError
+        if CommandLine.arguments.contains("--composer") {
+            model.composing = true
+            model.draftPrompt = "Review this project and fix the failing tests.\nExplain what changed and how you verified it."
+            model.draftWorkspace = FileManager.default.homeDirectoryForCurrentUser.path
+            model.draftModel = "example-model"
+            model.draftEffort = "high"
+            model.catalog = ModelCatalog(models: [ModelOption(id: "example-model", name: "Example model",
+                        efforts: ["low", "medium", "high"], defaultEffort: "medium")], defaultModel: "example-model", defaultEffort: "medium")
+        }
         // Hosting view rendering includes macOS controls and ScrollView, which
         // ImageRenderer intentionally leaves out. This renders our own view only.
         let view = NSHostingView(rootView: MenuPanel(model: model)
             .environment(\.colorScheme, .light).background(Color(nsColor: .windowBackgroundColor)))
-        let window = NSWindow(contentRect: NSRect(x: -2000, y: -2000, width: 410, height: 595),
+        let height: CGFloat = model.composing ? 680 : 635
+        let window = NSWindow(contentRect: NSRect(x: -2000, y: -2000, width: 410, height: height),
                               styleMask: .borderless, backing: .buffered, defer: false)
         window.contentView = view
-        view.frame = NSRect(x: 0, y: 0, width: 410, height: 595)
+        view.frame = NSRect(x: 0, y: 0, width: 410, height: height)
         window.orderFront(nil)
         RunLoop.main.run(until: Date().addingTimeInterval(0.5))
         view.layoutSubtreeIfNeeded()

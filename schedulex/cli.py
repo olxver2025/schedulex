@@ -68,6 +68,8 @@ def parser():
     add.add_argument("--sandbox", choices=("read-only", "workspace-write"), default="read-only",
                      help="Explicitly grant workspace writes with workspace-write")
     add.add_argument("--model", help="Optional model; otherwise uses your Codex default")
+    add.add_argument("--effort", "--reasoning-effort",
+                     help="Reasoning effort (model-dependent); omitted uses your Codex default")
     add.add_argument("--limit-id", default="codex", help="Usage bucket; use limits to inspect available buckets")
     add.add_argument("--min-remaining", type=float, default=1, help="Required remaining percent in every reported window")
     add.add_argument("--timeout", type=positive, default=7200, help="Maximum task runtime in seconds")
@@ -78,6 +80,7 @@ def parser():
     cancel.add_argument("id")
     commands.add_parser("limits", help="Read live subscription usage and reset times (no inference)")
     commands.add_parser("dashboard", help="JSON status for the menu bar app")
+    commands.add_parser("models", help="List live models and their supported reasoning efforts")
     menu = commands.add_parser("menubar", help="Open the macOS menu bar app")
     menu.add_argument("--app", type=Path, default=Path.home() / "Applications" / "Schedulex.app")
     worker = commands.add_parser("worker", help="Run local worker; keep computer awake and online")
@@ -114,7 +117,7 @@ def add_job(args, store):
     else:
         due = parse_time(args.at)
     spec = {"prompt": prompt, "cwd": str(cwd), "sandbox": args.sandbox,
-            "model": args.model, "window": args.window, "timezone": args.timezone,
+            "model": args.model, "effort": args.effort, "window": args.window, "timezone": args.timezone,
             "idle_minutes": args.idle_minutes, "min_remaining": args.min_remaining,
             "limit_id": args.limit_id, "timeout": args.timeout,
             "schedule": "after-reset" if args.after_reset else "at"}
@@ -184,6 +187,9 @@ def main(argv=None):
         if args.command == "limits":
             value = codex.snapshot(codex.executable(args.codex))
             print(json.dumps(value, indent=2))
+            return
+        if args.command == "models":
+            print(json.dumps(codex.catalog(codex.executable(args.codex)), indent=2))
             return
         store = Store(args.state_dir)
         if args.command == "dashboard":

@@ -25,6 +25,12 @@ if "app-server" in sys.argv:
         elif method == "account/read":
             result = {"account": {"type": "apiKey" if mode == "apikey" else "chatgpt",
                                    "planType": "free" if mode == "free" else "plus"}}
+        elif method == "model/list":
+            result = {"data": [{"model": "example-model", "displayName": "Example model",
+                                "supportedReasoningEfforts": [{"reasoningEffort": "low"}, {"reasoningEffort": "high"}],
+                                "defaultReasoningEffort": "low"}], "nextCursor": None}
+        elif method == "config/read":
+            result = {"config": {"model": "example-model", "model_reasoning_effort": "high"}}
         elif method == "account/rateLimits/read":
             result = {"rateLimitsByLimitId": {"codex": {
                 "limitId": "codex", "rateLimitReachedType": None,

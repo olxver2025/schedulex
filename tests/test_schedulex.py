@@ -82,7 +82,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(codex.five_hour_reset(value), 42)
 
     def test_full_prompt_and_permission_flags(self):
-        job = self.add(sandbox="workspace-write", model="example-model")
+        job = self.add(sandbox="workspace-write", model="example-model", effort="high")
         self.assertTrue(tick(self.store, str(self.fake)))
         self.assertEqual(self.store.get(job)["status"], "succeeded")
         logs = self.store.root / "runs" / job
@@ -91,9 +91,26 @@ class SchedulerTests(unittest.TestCase):
         self.assertIn("workspace-write", args)
         self.assertIn("never", args)
         self.assertIn("example-model", args)
+        self.assertIn('model_reasoning_effort="high"', args)
         self.assertIn('model_provider="openai"', args)
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", args)
         self.assertFalse(tick(self.store, str(self.fake)))
+
+    def test_model_catalog_and_effort_defaults(self):
+        value = codex.catalog(str(self.fake))
+        self.assertEqual(value["models"][0]["efforts"], ["low", "high"])
+        self.assertEqual(value["defaultModel"], "example-model")
+        self.assertEqual(value["defaultEffort"], "high")
+        command = codex.command(str(self.fake), self.spec(), self.root / "answer.txt")
+        self.assertFalse(any("model_reasoning_effort=" in part for part in command))
+
+    def test_cli_model_and_effort_are_saved(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            main(["--state-dir", str(self.store.root), "add", "--at", "+2h",
+                  "--model", "example-model", "--reasoning-effort", "high", "Full prompt"])
+        spec = json.loads(self.store.jobs()[0]["spec"])
+        self.assertEqual(spec["model"], "example-model")
+        self.assertEqual(spec["effort"], "high")
 
     def test_future_cancel_and_weekly_gate(self):
         future = self.add(due=time.time() + 3600)
