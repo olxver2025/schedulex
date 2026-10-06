@@ -27,10 +27,11 @@ persistent jobs being checked when the worker next runs; no automatic wake is of
 
 ## Installer and menu bar, version 0.2.0
 
-- 30 tests pass, including normalized usage/reset data, unknown availability,
+- 31 tests pass, including normalized usage/reset data, unknown availability,
   full active queue presentation, live worker locks, real installed shell launchers,
   quoting paths with spaces/shell metacharacters, reinstall, unrelated-file protection,
-  and waiting for an old launchd menu bar agent to unload before replacing it.
+  waiting for an old launchd menu bar agent to unload before replacing it,
+  and creating the app Resources folder if archive extraction omitted the empty directory.
 - Native SwiftUI app builds for macOS 14+ using the installed stable SDK. Its
   bundle passes `codesign --verify --deep --strict` after installation.
 - Installed both `schx` and `schedulex` in `~/.local/bin` and verified their commands
@@ -42,6 +43,9 @@ persistent jobs being checked when the worker next runs; no automatic wake is of
   Plus plan, five-hour and weekly allowance, exact reset timestamps, and one banked
   reset with expiry. No banked reset was redeemed.
 - Generated an architecture-specific installer zip with the prebuilt native app.
+- Extracted the final zip into a new temporary folder and ran its `install.command`
+  with custom paths and no login/shell changes. Both aliases worked, and the installed
+  bundle passed signature verification without requiring a native rebuild.
 - Native Computer Use inspection timed out. App process state and its actual
   refresh pipeline were verified directly; the SwiftUI panel is rendered by a
   separate native preview harness. Visually inspected both the live usage panel and

@@ -114,6 +114,7 @@ def install(args):
     if target_app.exists():
         shutil.rmtree(target_app)
     shutil.copytree(bundle, target_app)
+    (target_app / "Contents/Resources").mkdir(parents=True, exist_ok=True)
     (target_app / "Contents/Resources/configuration.json").write_text(json.dumps(configuration))
     subprocess.run(["codesign", "--force", "--sign", "-", str(target_app)], check=True)
     if not args.no_shell:

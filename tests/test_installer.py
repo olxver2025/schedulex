@@ -74,6 +74,11 @@ class InstallerTests(unittest.TestCase):
         sleep.assert_called_once_with(0.2)
         self.assertEqual(control.call_count, 3)
 
+    def test_installer_handles_archive_without_empty_resources_directory(self):
+        (installer.ROOT / "macos/Schedulex.app/Contents/Resources").rmdir()
+        self.install()
+        self.assertTrue((self.args.app_dir / "Schedulex.app/Contents/Resources/configuration.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
