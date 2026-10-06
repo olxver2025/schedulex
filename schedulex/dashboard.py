@@ -47,7 +47,9 @@ def dashboard(store, binary):
     for row in active + recent:
         spec = json.loads(row["spec"])
         jobs.append({"id": row["id"], "prompt": spec["prompt"], "status": row["status"],
-                     "due": row["due"], "cwd": spec["cwd"], "note": row["note"],
+                     "due": row["due"], "cwd": spec.get("cwd"), "note": row["note"],
+                     "destination": spec.get("destination", "local"),
+                     "cloudEnv": spec.get("cloud_env"), "cloudUrl": row.get("cloud_url"),
                      "window": spec.get("window"), "timezone": spec.get("timezone"),
                      "runs": str(store.root / "runs" / row["id"]),
                      "model": spec.get("model"), "effort": spec.get("effort")})

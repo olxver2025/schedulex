@@ -16,8 +16,10 @@ class Store:
         self.db.execute("""CREATE TABLE IF NOT EXISTS jobs (
             id TEXT PRIMARY KEY, created REAL NOT NULL, due REAL NOT NULL,
             status TEXT NOT NULL, spec TEXT NOT NULL, note TEXT NOT NULL DEFAULT '',
-            started REAL, finished REAL, exit_code INTEGER
+            started REAL, finished REAL, exit_code INTEGER, cloud_url TEXT
         )""")
+        if "cloud_url" not in {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}:
+            self.db.execute("ALTER TABLE jobs ADD COLUMN cloud_url TEXT")
         self.db.commit()
         os.chmod(self.root / "jobs.sqlite3", 0o600)
 
@@ -27,6 +29,12 @@ class Store:
             self.db.execute("INSERT INTO jobs(id,created,due,status,spec) VALUES(?,?,?,?,?)",
                             (job_id, time.time(), due, "pending", json.dumps(spec)))
         return job_id
+
+    def remove_pending(self, job_id):
+        with self.db:
+            cursor = self.db.execute("DELETE FROM jobs WHERE id=? AND status='pending'", (job_id,))
+        if not cursor.rowcount:
+            raise ValueError(f"Could not roll back pending job {job_id}")
 
     def jobs(self, pending=False):
         query = "SELECT * FROM jobs"
@@ -55,6 +63,11 @@ class Store:
         with self.db:
             self.db.execute("UPDATE jobs SET status=?,exit_code=?,note=?,finished=? WHERE id=?",
                             (status, code, note, time.time(), job_id))
+
+    def cloud_submitted(self, job_id, url, note):
+        with self.db:
+            self.db.execute("UPDATE jobs SET status='submitted',cloud_url=?,note=?,finished=? WHERE id=?",
+                            (url, note, time.time(), job_id))
 
     def cancel(self, job_id):
         self.get(job_id)

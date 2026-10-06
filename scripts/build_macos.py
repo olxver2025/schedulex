@@ -22,6 +22,10 @@ def build(destination=None):
     subprocess.run(["xcrun", "swiftc", "-parse-as-library", "-O", *( ["-sdk", sdk] if sdk else [] ), "-target",
                     f"{architecture}-apple-macosx14.0", "-module-cache-path", "/tmp/schedulex-swift-cache",
                     str(ROOT / "macos" / "Schedulex.swift"), "-o", str(contents / "MacOS" / "Schedulex")], check=True)
+    subprocess.run(["xcrun", "swiftc", "-O", *( ["-sdk", sdk] if sdk else [] ), "-target",
+                    f"{architecture}-apple-macosx14.0", "-module-cache-path", "/tmp/schedulex-swift-cache",
+                    str(ROOT / "macos" / "WakeHelper.swift"), "-o",
+                    str(contents / "MacOS" / "SchedulexPowerHelper")], check=True)
     info = {"CFBundleExecutable": "Schedulex", "CFBundleIdentifier": "local.schedulex.menubar",
             "CFBundleName": "Schedulex", "CFBundleDisplayName": "Schedulex", "CFBundlePackageType": "APPL",
             "CFBundleShortVersionString": "0.3.0", "CFBundleVersion": "3", "LSMinimumSystemVersion": "14.0",

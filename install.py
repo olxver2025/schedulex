@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Per-user installer. No pip, root access, or Python runtime dependencies."""
+"""Per-user installer; timed macOS wake support installs a small root helper."""
 import argparse
 import json
 import os
@@ -68,9 +68,15 @@ def install(args):
     if not bundle.exists():
         bundle = ROOT / "dist" / "Schedulex.app"
     bundle_info = bundle / "Contents/Info.plist"
-    if not bundle_info.exists() or plistlib.loads(bundle_info.read_bytes()).get("SchedulexArchitecture") != platform.machine():
+    helper_in_bundle = bundle / "Contents/MacOS/SchedulexPowerHelper"
+    if (not bundle_info.exists() or (not args.no_start and not helper_in_bundle.is_file()) or
+            plistlib.loads(bundle_info.read_bytes()).get("SchedulexArchitecture") != platform.machine()):
         from scripts.build_macos import build
         bundle = build()
+        helper_in_bundle = bundle / "Contents/MacOS/SchedulexPowerHelper"
+    if not args.no_start:
+        from schedulex.power import install_helper
+        install_helper(helper_in_bundle)
     # Prepare payload before replacing an existing install.
     prefix.parent.mkdir(parents=True, exist_ok=True)
     stage = prefix.with_name(prefix.name + ".installing")
@@ -82,17 +88,19 @@ def install(args):
         shutil.copy2(ROOT / "README.md", stage / "README.md")
         configuration = {"python": sys.executable, "source": str(prefix), "codex": binary,
                          "stateDir": str(state), "path": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
-                         "codexHome": os.environ.get("CODEX_HOME")}
+                         "codexHome": os.environ.get("CODEX_HOME"),
+                         "powerHelper": str(app_dir / "Schedulex.app/Contents/MacOS/SchedulexPowerHelper")}
         (stage / MARKER).write_text(json.dumps(configuration, indent=2))
         backup = prefix.with_name(prefix.name + ".previous")
         if backup.exists():
             raise ValueError(f"Previous installation backup exists: {backup}")
         if prefix.exists():
-            # Stop our worker before replacing its runtime. Keep the queue and history.
+            # Stop only the user worker. Keep its queue and the privileged wake service.
             if not args.no_start:
-                env = dict(os.environ, PYTHONPATH=str(prefix))
-                subprocess.run([sys.executable, "-P", "-m", "schedulex", "--state-dir", str(state),
-                                "service", "uninstall"], env=env, check=True)
+                worker_target = f"gui/{os.getuid()}/local.schedulex.worker"
+                unload_agent(worker_target)
+                worker_agent = Path.home() / "Library/LaunchAgents/local.schedulex.worker.plist"
+                worker_agent.unlink(missing_ok=True)
             prefix.rename(backup)
         stage.rename(prefix)
         if backup.exists():
@@ -103,6 +111,7 @@ def install(args):
     bin_dir.mkdir(parents=True, exist_ok=True)
     wrapper_text = ("#!/bin/sh\n# Schedulex managed launcher\n"
                     f"export PYTHONPATH={shlex.quote(str(prefix))}\n"
+                    f"export SCHEDULEX_POWER_HELPER={shlex.quote(str(app_dir / 'Schedulex.app/Contents/MacOS/SchedulexPowerHelper'))}\n"
                     "if [ -z \"${SCHEDULEX_HOME:-}\" ]; then\n"
                     f"  export SCHEDULEX_HOME={shlex.quote(str(state))}\nfi\n"
                     f"exec {shlex.quote(sys.executable)} -P -m schedulex --codex {shlex.quote(binary)} \"$@\"\n")
@@ -125,7 +134,8 @@ def install(args):
             with shell_file.open("a") as stream:
                 stream.write("\n" + line)
     if not args.no_start:
-        env = dict(os.environ, PYTHONPATH=str(prefix))
+        env = dict(os.environ, PYTHONPATH=str(prefix),
+                   SCHEDULEX_POWER_HELPER=str(app_dir / "Schedulex.app/Contents/MacOS/SchedulexPowerHelper"))
         subprocess.run([sys.executable, "-P", "-m", "schedulex", "--state-dir", str(state),
                         "--codex", binary, "service", "install"], env=env, check=True)
         agent = Path.home() / "Library/LaunchAgents/local.schedulex.menubar.plist"

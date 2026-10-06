@@ -11,6 +11,7 @@ import time
 from zoneinfo import ZoneInfo
 
 from . import codex
+from . import power
 from .store import Store
 from .worker import run
 
@@ -51,7 +52,7 @@ def positive(value):
 
 
 def parser():
-    p = argparse.ArgumentParser(description="Schedule full Codex prompts locally using your subscription.")
+    p = argparse.ArgumentParser(description="Schedule prompts for local Codex runs or Codex Cloud.")
     p.add_argument("--state-dir", default=os.environ.get("SCHEDULEX_HOME", "~/.local/share/schedulex"))
     p.add_argument("--codex", default=os.environ.get("SCHEDULEX_CODEX", "codex"), help="Codex executable")
     commands = p.add_subparsers(dest="command", required=True)
@@ -62,6 +63,7 @@ def parser():
     when.add_argument("--at", help="ISO time with offset, or +30m / +2h / +1d")
     when.add_argument("--after-reset", action="store_true", help="Next reported five-hour reset")
     add.add_argument("--cwd", type=Path, default=Path.cwd(), help="Workspace to run in")
+    add.add_argument("--cloud-env", help="Submit to this configured Codex Cloud environment when due")
     add.add_argument("--window", type=window, help="Allowed start hours, e.g. 23:00-07:00")
     add.add_argument("--timezone", default="Europe/London", help="IANA timezone for allowed hours")
     add.add_argument("--idle-minutes", type=positive, default=0, help="Require Mac keyboard/mouse inactivity before starting")
@@ -105,8 +107,11 @@ def add_job(args, store):
     if not prompt.strip():
         raise ValueError("Prompt cannot be empty")
     cwd = args.cwd.expanduser().resolve()
-    if not cwd.is_dir():
+    if not args.cloud_env and not cwd.is_dir():
         raise ValueError("--cwd must be an existing directory")
+    cloud_env = args.cloud_env.strip() if args.cloud_env else None
+    if args.cloud_env and not cloud_env:
+        raise ValueError("--cloud-env cannot be empty")
     ZoneInfo(args.timezone)
     if args.idle_minutes and sys.platform != "darwin":
         raise ValueError("--idle-minutes currently requires macOS; use --window on other platforms")
@@ -116,14 +121,26 @@ def add_job(args, store):
         due = max(time.time(), codex.five_hour_reset(codex.snapshot(codex.executable(args.codex)), args.limit_id)) + 30
     else:
         due = parse_time(args.at)
-    spec = {"prompt": prompt, "cwd": str(cwd), "sandbox": args.sandbox,
+    spec = {"prompt": prompt, "cwd": str(cwd) if not cloud_env else None,
+            "destination": "cloud" if cloud_env else "local", "cloud_env": cloud_env,
+            "sandbox": args.sandbox,
             "model": args.model, "effort": args.effort, "window": args.window, "timezone": args.timezone,
             "idle_minutes": args.idle_minutes, "min_remaining": args.min_remaining,
             "limit_id": args.limit_id, "timeout": args.timeout,
             "schedule": "after-reset" if args.after_reset else "at"}
     job_id = store.add(spec, due)
-    print(f"Scheduled {job_id} for {timestamp(due)} ({args.sandbox})")
-    print("Run `schedulex worker` or install the background worker with `schedulex service install`.")
+    if sys.platform == "darwin":
+        try:
+            power.schedule_wake(job_id, max(due, time.time() + 15))
+        except power.PowerError as error:
+            store.remove_pending(job_id)
+            raise ValueError(f"Could not schedule the Mac wake; install the background service first. {error}") from error
+    destination = f"Codex Cloud environment {cloud_env}" if cloud_env else args.sandbox
+    print(f"Scheduled {job_id} for {timestamp(due)} ({destination})")
+    if sys.platform == "darwin":
+        print("Schedulex will wake this Mac at the scheduled time and keep it awake while local Codex runs.")
+    else:
+        print("Run `schedulex worker` or install the background worker with `schedulex service install`.")
 
 
 def service(args, store):
@@ -135,7 +152,13 @@ def service(args, store):
     if args.action == "status":
         result = subprocess.run(["launchctl", "print", target], capture_output=True, text=True)
         print(result.stdout if result.returncode == 0 else "Schedulex background service is not loaded")
+        power_target = power.helper_paths()[2]
+        helper = subprocess.run(["launchctl", "print", power_target], capture_output=True, text=True)
+        print(helper.stdout if helper.returncode == 0 else "Schedulex timed-wake helper is not installed")
     elif args.action == "uninstall":
+        if Path(power.helper_paths()[0]).is_file():
+            power.cancel_all_wakes()
+            power.remove_helper()
         result = subprocess.run(["launchctl", "bootout", target], capture_output=True, text=True)
         if result.returncode:
             status = subprocess.run(["launchctl", "print", target], capture_output=True)
@@ -147,6 +170,12 @@ def service(args, store):
         if plist.exists():
             raise ValueError("Service already installed; uninstall it before changing its queue or binary")
         binary = codex.executable(args.codex)
+        power.install_helper(power.find_helper_binary())
+        for row in store.jobs(pending=True):
+            try:
+                power.schedule_wake(row["id"], max(row["due"], time.time() + 15))
+            except power.PowerError as error:
+                raise ValueError(f"Could not schedule wake for existing job {row['id']}: {error}") from error
         package_root = str(Path(__file__).resolve().parent.parent)
         document = {
             "Label": label,
@@ -156,6 +185,7 @@ def service(args, store):
             "EnvironmentVariables": {
                 "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
                 "PYTHONPATH": package_root,
+                "SCHEDULEX_POWER_SOCKET": power.socket_path(),
                 **({"CODEX_HOME": os.environ["CODEX_HOME"]} if "CODEX_HOME" in os.environ else {}),
             },
             "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 30,
@@ -207,7 +237,12 @@ def main(argv=None):
             print(json.dumps(row, indent=2, ensure_ascii=False))
         elif args.command == "cancel":
             store.cancel(args.id)
-            print(f"Cancelled {args.id}")
+            try:
+                power.cancel_wake(args.id)
+            except power.PowerError as error:
+                print(f"Cancelled {args.id}, but the Mac may still wake once: {error}", file=sys.stderr)
+            else:
+                print(f"Cancelled {args.id}")
         elif args.command == "worker":
             run(store, codex.executable(args.codex), args.once, args.interval)
         elif args.command == "service":

@@ -14,7 +14,7 @@ struct ComposerChecks {
         let draft = TaskDraft(prompt: prompt, workspace: config.source,
                               date: Date().addingTimeInterval(7200), afterReset: false,
                               allowEdits: true, overnight: true, idleOnly: true,
-                              model: "example-model", effort: "high")
+                              model: "example-model", effort: "high", cloud: false, cloudEnvironment: "")
         try Bridge.queue(config, draft)
         let dashboard = try JSONDecoder().decode(Dashboard.self, from: Bridge.run(config, ["dashboard"]))
         try require(dashboard.jobs.count == 1, "Expected one queued job")
@@ -28,7 +28,8 @@ struct ComposerChecks {
                     "Write and idle options must be saved")
         _ = try Bridge.run(config, ["cancel", job.id])
         let resetDraft = TaskDraft(prompt: "reset task", workspace: config.source, date: .distantPast,
-                         afterReset: true, allowEdits: false, overnight: false, idleOnly: false, model: "", effort: "")
+                         afterReset: true, allowEdits: false, overnight: false, idleOnly: false, model: "", effort: "",
+                         cloud: false, cloudEnvironment: "")
         try Bridge.queue(config, resetDraft)
         let after = try JSONDecoder().decode(Dashboard.self, from: Bridge.run(config, ["dashboard"]))
         let resetJob = after.jobs.first { $0.status == "pending" }!
@@ -36,7 +37,8 @@ struct ComposerChecks {
         try require(resetJob.due > Date().addingTimeInterval(3500).timeIntervalSince1970, "Reset scheduling must read account reset time")
         _ = try Bridge.run(config, ["cancel", resetJob.id])
         let invalid = TaskDraft(prompt: "  \n", workspace: config.source, date: .distantFuture,
-                          afterReset: false, allowEdits: false, overnight: false, idleOnly: false, model: "", effort: "")
+                          afterReset: false, allowEdits: false, overnight: false, idleOnly: false, model: "", effort: "",
+                          cloud: false, cloudEnvironment: "")
         do {
             try Bridge.queue(config, invalid)
             throw NSError(domain: "ComposerChecks", code: 2)

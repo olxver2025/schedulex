@@ -28,8 +28,11 @@ class SchedulerTests(unittest.TestCase):
         self.fake.chmod(0o700)
         self.env = patch.dict(os.environ, {"FAKE_MODE": "success"})
         self.env.start()
+        self.wake_stub = patch("schedulex.cli.power.schedule_wake")
+        self.wake_stub.start()
 
     def tearDown(self):
+        self.wake_stub.stop()
         self.env.stop()
         self.store.db.close()
         self.temp.cleanup()
@@ -219,6 +222,8 @@ class SchedulerTests(unittest.TestCase):
         from schedulex.cli import service
         args = parser().parse_args(["--codex", str(self.fake), "service", "install"])
         with patch("schedulex.cli.sys.platform", "darwin"), patch("schedulex.cli.Path.home", return_value=self.root), \
+                patch("schedulex.cli.power.find_helper_binary", return_value=self.fake), \
+                patch("schedulex.cli.power.install_helper"), \
                 patch("schedulex.cli.subprocess.run") as launchctl, contextlib.redirect_stdout(io.StringIO()):
             launchctl.return_value = subprocess.CompletedProcess([], 0, "loaded", "")
             service(args, self.store)

@@ -23,13 +23,16 @@ struct ScheduledJob: Codable, Identifiable, Sendable {
     let prompt: String
     let status: String
     let due: Double
-    let cwd: String
+    let cwd: String?
     let note: String
     let window: String?
     let timezone: String?
     let runs: String
     let model: String?
     let effort: String?
+    let destination: String?
+    let cloudEnv: String?
+    let cloudUrl: String?
 }
 
 struct UsageWindow: Codable, Identifiable, Sendable {
@@ -73,21 +76,31 @@ struct TaskDraft: Sendable {
     let idleOnly: Bool
     let model: String
     let effort: String
+    let cloud: Bool
+    let cloudEnvironment: String
 
     func arguments(promptFile: String) throws -> [String] {
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw NSError(domain: "Schedulex", code: 1, userInfo: [NSLocalizedDescriptionKey: "Enter a task prompt."])
         }
         let path = (workspace as NSString).expandingTildeInPath
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
-            throw NSError(domain: "Schedulex", code: 1, userInfo: [NSLocalizedDescriptionKey: "Choose an existing workspace folder."])
+        if !cloud {
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                throw NSError(domain: "Schedulex", code: 1, userInfo: [NSLocalizedDescriptionKey: "Choose an existing workspace folder."])
+            }
+        } else if cloudEnvironment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            throw NSError(domain: "Schedulex", code: 1, userInfo: [NSLocalizedDescriptionKey: "Enter a Codex Cloud environment ID."])
         }
         if !afterReset && date <= Date() {
             throw NSError(domain: "Schedulex", code: 1, userInfo: [NSLocalizedDescriptionKey: "Choose a future date and time."])
         }
-        var args = ["add", "--prompt-file", promptFile, "--cwd", path,
-                    "--sandbox", allowEdits ? "workspace-write" : "read-only"]
+        var args = ["add", "--prompt-file", promptFile]
+        if cloud {
+            args += ["--cloud-env", cloudEnvironment.trimmingCharacters(in: .whitespacesAndNewlines)]
+        } else {
+            args += ["--cwd", path, "--sandbox", allowEdits ? "workspace-write" : "read-only"]
+        }
         args += afterReset ? ["--after-reset"] : ["--at", ISO8601DateFormatter().string(from: date)]
         if overnight { args += ["--window", "23:00-07:00", "--timezone", TimeZone.current.identifier] }
         if idleOnly { args += ["--idle-minutes", "15"] }
@@ -158,6 +171,8 @@ final class MenuModel {
     var busy = false
     var composing = false
     var draftPrompt = ""
+    var draftCloud = false
+    var draftCloudEnvironment = ""
     var draftWorkspace = FileManager.default.homeDirectoryForCurrentUser.path
     var draftDate = Date().addingTimeInterval(3600)
     var draftAfterReset = false
@@ -217,7 +232,8 @@ final class MenuModel {
         let draft = TaskDraft(prompt: draftPrompt, workspace: draftWorkspace, date: draftDate,
                               afterReset: draftAfterReset, allowEdits: draftAllowEdits,
                               overnight: draftOvernight, idleOnly: draftIdleOnly,
-                              model: draftModel, effort: draftEffort)
+                              model: draftModel, effort: draftEffort, cloud: draftCloud,
+                              cloudEnvironment: draftCloudEnvironment)
         busy = true
         draftError = nil
         do {
@@ -300,6 +316,9 @@ struct JobView: View {
                     .foregroundStyle(job.status == "failed" || job.status == "interrupted" ? .orange : .secondary)
             }
             Text(dateLabel(job.due)).font(.caption).foregroundStyle(.secondary)
+            if let environment = job.cloudEnv {
+                Text("Codex Cloud · \(environment)").font(.caption).foregroundStyle(.secondary)
+            }
             if job.model != nil || job.effort != nil {
                 Text("\(job.model ?? "Codex default model") · \(job.effort ?? "default") effort")
                     .font(.caption).foregroundStyle(.secondary)
@@ -316,7 +335,11 @@ struct JobView: View {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(job.prompt, forType: .string)
                 }
-                Button("Workspace") { NSWorkspace.shared.open(URL(fileURLWithPath: job.cwd)) }
+                if let cloudUrl = job.cloudUrl, let url = URL(string: cloudUrl) {
+                    Link("Open Cloud task", destination: url)
+                } else if let cwd = job.cwd, !cwd.isEmpty {
+                    Button("Workspace") { NSWorkspace.shared.open(URL(fileURLWithPath: cwd)) }
+                }
                 if FileManager.default.fileExists(atPath: job.runs) {
                     Button("Results") { NSWorkspace.shared.open(URL(fileURLWithPath: job.runs)) }
                 }
@@ -346,18 +369,29 @@ struct TaskComposer: View {
                 .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(.quaternary))
                 .accessibilityLabel("Complete task prompt")
-            Text("Workspace").font(.subheadline).fontWeight(.medium)
-            HStack {
-                TextField("Folder path", text: $model.draftWorkspace)
-                    .textFieldStyle(.roundedBorder).accessibilityLabel("Workspace folder")
-                Button("Choose…") {
-                    let panel = NSOpenPanel()
-                    panel.canChooseDirectories = true
-                    panel.canChooseFiles = false
-                    panel.allowsMultipleSelection = false
-                    panel.prompt = "Choose workspace"
-                    panel.begin { response in
-                        if response == .OK, let url = panel.url { model.draftWorkspace = url.path }
+            Picker("Run in", selection: $model.draftCloud) {
+                Text("This Mac").tag(false)
+                Text("Codex Cloud").tag(true)
+            }.pickerStyle(.segmented)
+            if model.draftCloud {
+                TextField("Cloud environment ID", text: $model.draftCloudEnvironment)
+                    .textFieldStyle(.roundedBorder).accessibilityLabel("Codex Cloud environment ID")
+                Text("Find configured environments with `codex cloud`. Tasks run in the selected environment’s GitHub repositories.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                Text("Workspace").font(.subheadline).fontWeight(.medium)
+                HStack {
+                    TextField("Folder path", text: $model.draftWorkspace)
+                        .textFieldStyle(.roundedBorder).accessibilityLabel("Workspace folder")
+                    Button("Choose…") {
+                        let panel = NSOpenPanel()
+                        panel.canChooseDirectories = true
+                        panel.canChooseFiles = false
+                        panel.allowsMultipleSelection = false
+                        panel.prompt = "Choose workspace"
+                        panel.begin { response in
+                            if response == .OK, let url = panel.url { model.draftWorkspace = url.path }
+                        }
                     }
                 }
             }
@@ -402,7 +436,9 @@ struct TaskComposer: View {
                            displayedComponents: [.date, .hourAndMinute])
                 Text("Time zone: \(TimeZone.current.identifier)").font(.caption).foregroundStyle(.secondary)
             }
-            Toggle("Allow edits in this workspace", isOn: $model.draftAllowEdits)
+            if !model.draftCloud {
+                Toggle("Allow edits in this workspace", isOn: $model.draftAllowEdits)
+            }
             Toggle("Only start overnight (23:00–07:00)", isOn: $model.draftOvernight)
             Toggle("Wait for 15 minutes of keyboard/mouse inactivity", isOn: $model.draftIdleOnly)
             if let error = model.draftError {
@@ -411,9 +447,10 @@ struct TaskComposer: View {
             HStack {
                 if model.busy { ProgressView().controlSize(.small) }
                 Spacer()
-                Button("Queue task") { Task { await model.queueDraft() } }
+                Button(model.draftCloud ? "Queue Cloud task" : "Queue task") { Task { await model.queueDraft() } }
                     .buttonStyle(.borderedProminent)
-                    .disabled(model.busy || model.draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(model.busy || model.draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                              (model.draftCloud && model.draftCloudEnvironment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
             }
         }.padding(16).frame(width: 410).disabled(model.busy)
             .task { await model.loadModels() }
@@ -527,7 +564,7 @@ struct MenuPanel: View {
 #if !PREVIEW
 @main
 struct SchedulexApp: App {
-    @State private var model = MenuModel()
+    private let model = MenuModel()
     var body: some Scene {
         MenuBarExtra("Schedulex", systemImage: "clock.badge.checkmark") {
             MenuPanel(model: model)

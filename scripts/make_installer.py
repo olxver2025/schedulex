@@ -9,7 +9,8 @@ from build_macos import build, ROOT
 def main():
     app = build()
     target = ROOT / "dist" / f"Schedulex-0.3.0-macos-{platform.machine()}-installer.zip"
-    files = [ROOT / "install.command", ROOT / "install.py", ROOT / "README.md", ROOT / "macos/Schedulex.swift"]
+    files = [ROOT / "install.command", ROOT / "install.py", ROOT / "README.md",
+             ROOT / "macos/Schedulex.swift", ROOT / "macos/WakeHelper.swift"]
     files += list((ROOT / "schedulex").glob("*.py"))
     files += list((ROOT / "scripts").glob("*.py"))
     with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:

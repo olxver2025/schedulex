@@ -1,8 +1,9 @@
 # schedulex
 
 A lightweight local CLI that queues complete prompts and runs Codex later using
-your existing ChatGPT subscription login. Python 3.11+, no runtime dependencies.
-macOS and Linux; optional macOS login service.
+your existing ChatGPT subscription login. It can dispatch either to a local
+workspace or a configured Codex Cloud environment. Python 3.11+, no runtime
+dependencies. macOS and Linux; optional macOS login service.
 
 ## macOS installer and menu bar
 
@@ -14,10 +15,11 @@ and a signed-in Codex CLI are required; the menu bar app needs macOS 14+.
 
 The installer copies the runtime to `~/Library/Application Support/Schedulex`, so
 the installed commands and login services work even if you move this repository.
-It preserves the existing queue and results. No pip or administrator password is
-needed. The source installer builds the native app using Apple's command line
-tools if a matching prebuilt app isn't present. The installer zip includes a
-prebuilt app for the architecture named in its filename.
+It preserves the existing queue and results. The first background-service install
+asks for administrator authorization to add timed-wake support. The source installer
+builds the native app using Apple's command line tools if a matching prebuilt app
+isn't present. The installer zip includes a prebuilt app for the architecture named
+in its filename.
 
 The clock/checkmark menu bar icon shows scheduled tasks, worker state, remaining
 subscription allowance, absolute reset times and countdowns, and the authoritative
@@ -39,7 +41,18 @@ schedulex list
 schx menubar
 schx models
 schx add --at +2h --model gpt-6.1-sol --effort high --prompt-file prompt.txt
+schx add --at +2h --cloud-env ENV_ID --prompt-file prompt.txt
 ```
+
+Use `--cloud-env ENV_ID` to queue a task for Codex Cloud. Find available
+environment IDs with `codex cloud`; each environment supplies its own GitHub
+repositories, setup, permissions, and network access. Schedulex keeps the
+scheduled prompt in its local queue, then submits it with `codex cloud exec`
+when due. The local worker and computer must be available at dispatch time.
+After Codex accepts the task, it runs remotely while this computer is asleep.
+The Schedulex task then shows **Submitted** and links to the Cloud task when the
+CLI returns its URL. Schedulex cancellation works only before dispatch; track
+or continue a submitted task in Codex Cloud.
 
 Both the CLI and menu bar support per-task model and reasoning effort overrides.
 Use `--model` and `--effort` (alias `--reasoning-effort`) in the CLI. In the composer,
@@ -138,8 +151,7 @@ It does not call the separately billed OpenAI API with an API key.
 
 ## Background worker
 
-Keep the computer awake, online, and logged in. Being powered on while asleep is
-insufficient. For macOS, install a LaunchAgent:
+For macOS, install the background worker:
 
 ```sh
 schedulex service install
@@ -147,16 +159,28 @@ schedulex service status
 schedulex service uninstall
 ```
 
-Installation explicitly starts a persistent worker at login. It records the current
-Python executable, source location, Codex binary, PATH, CODEX_HOME (if set), and queue
-path. Keep those paths available; reinstall after moving them. It neither wakes
-the computer nor prevents sleep. Overdue jobs are checked after wake or restart
-and still obey their window and allowance checks. A LaunchAgent needs access to
-the project directory; macOS privacy permissions may require local setup.
+The first install asks for administrator authorization to add Schedulex's small
+scheduled-wake helper. It uses macOS power events to wake the computer for a queued
+job. The worker schedules pending tasks, removes a wake when a task is canceled, and
+reschedules one when a task must wait for its time window, inactivity, or Codex
+allowance. `service uninstall` removes pending Schedulex wake events and the helper;
+your queue and results stay saved.
+
+For a local Codex run, Schedulex prevents idle system sleep only while Codex is
+running. The display may still turn off. When Codex finishes, Schedulex releases the
+sleep hold and normal macOS sleep settings apply. A Codex Cloud task only needs the
+Mac awake long enough to submit the task; Cloud continues remotely afterward.
+
+The Mac must be sleeping rather than shut down, online, and logged into the user
+account that runs Schedulex. Keep the configured Python, source, Codex, and queue
+paths available; reinstall after moving them. macOS or the hardware may defer or
+ignore a timed wake in some power states, and the display may turn on depending on
+the Mac and its settings. A LaunchAgent also needs access to the project directory;
+macOS privacy permissions may require local setup.
 
 On Linux run `schedulex worker` in a persistent user session. Foreground mode works
-on macOS too; optionally `caffeinate -i schedulex worker` prevents idle sleep while
-that command is running. Closing a foreground worker stops it; the queue stays saved.
+on macOS too, but timed wake support requires the installed macOS background service.
+Closing a foreground worker stops it; the queue stays saved.
 
 ## Manage and review
 

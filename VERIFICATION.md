@@ -22,8 +22,8 @@ Verified on macOS on 6 October 2026 with Python 3.14.7 and Codex CLI 0.160.0.
 
 The original CLI verification did not install the persistent service. A multi-hour wait until a real
 quota reset was not performed; reset scheduling uses the live reported timestamp
-and the clock/allowance gates covered by the tests. Sleep/wake behavior relies on
-persistent jobs being checked when the worker next runs; no automatic wake is offered.
+and the clock/allowance gates covered by the tests. At that revision, sleep/wake
+behavior relied on persistent jobs being checked when the worker next ran.
 
 ## Installer and menu bar, version 0.2.0
 
@@ -63,3 +63,18 @@ persistent jobs being checked when the worker next runs; no automatic wake is of
   Empty prompts were rejected; all temporary test jobs were cancelled.
 - Visually inspected the native composer render, including prompt editor, workspace
   picker, model/effort controls, schedule modes, permission toggles, and queue action.
+
+## Scheduled wake and run-time sleep hold
+
+- Added a per-user macOS LaunchDaemon that schedules one-shot `pmset` wake events
+  through an authenticated local socket. The worker reschedules a wake when a job
+  waits for its allowed window, inactivity requirement, or usage allowance.
+- Local Codex runs use `caffeinate -i` tied to the Codex process, allowing display
+  sleep while holding off idle system sleep. Cloud dispatch releases the Mac after
+  submission.
+- The native app and helper compile successfully on 6 October 2026. The helper has
+  been installed with administrator authorization. The worker LaunchAgent, menu bar
+  LaunchAgent, and per-user system wake helper all report `running`; the installed app
+  passes `codesign --verify --deep --strict`.
+- No Schedulex job was queued during installation, so no timed wake event was added.
+  Actual sleep/wake behavior, display state, and post-task sleep remain unverified.
