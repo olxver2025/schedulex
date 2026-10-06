@@ -1,4 +1,7 @@
 """Use the supported CLI and app-server; never read or copy auth tokens."""
+import base64
+import hashlib
+import struct
 import json
 import os
 import selectors
@@ -25,19 +28,114 @@ def executable(value="codex"):
 
 
 class AppServer:
-    def __init__(self, binary):
+    def __init__(self, binary, shared=False):
+        if shared:
+            result = subprocess.run([binary, "app-server", "daemon", "start"],
+                                    capture_output=True, text=True, timeout=30, env=subscription_env())
+            if result.returncode:
+                raise CodexError("Could not start the shared Codex server: " + result.stderr.strip())
         self.process = subprocess.Popen(
-            [binary, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            [binary, "app-server"] + (["proxy"] if shared else []), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, start_new_session=True, env=subscription_env(),
         )
         self.selector = selectors.DefaultSelector()
         self.selector.register(self.process.stdout, selectors.EVENT_READ)
         self.buffer = b""
         self.serial = 0
+        self.notifications = []
+        self.shared = shared
+        self.fragments = b""
+        if shared:
+            try:
+                self.upgrade()
+            except BaseException:
+                self.close()
+                raise
 
     def send(self, message):
-        self.process.stdin.write((json.dumps(message) + "\n").encode())
+        payload = json.dumps(message).encode()
+        if self.shared:
+            self.send_frame(payload)
+            return
+        self.process.stdin.write(payload + b"\n")
         self.process.stdin.flush()
+
+    def send_frame(self, payload, opcode=1):
+        mask = os.urandom(4)
+        length = len(payload)
+        header = bytes([0x80 | opcode])
+        if length < 126:
+            header += bytes([0x80 | length])
+        elif length < 65536:
+            header += bytes([0x80 | 126]) + struct.pack("!H", length)
+        else:
+            header += bytes([0x80 | 127]) + struct.pack("!Q", length)
+        masked = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+        self.process.stdin.write(header + mask + masked)
+        self.process.stdin.flush()
+
+    def read_bytes(self, count, deadline):
+        while len(self.buffer) < count:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not self.selector.select(remaining):
+                raise TimeoutError("Timed out waiting for Codex")
+            chunk = os.read(self.process.stdout.fileno(), 65536)
+            if not chunk:
+                raise CodexError("Codex app-server disconnected; inspect the chat before retrying")
+            self.buffer += chunk
+        result, self.buffer = self.buffer[:count], self.buffer[count:]
+        return result
+
+    def upgrade(self):
+        # `app-server proxy` forwards raw socket bytes, including WebSocket framing.
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.process.stdin.write(("GET /rpc HTTP/1.1\r\nHost: codex-app-server\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n\r\n").encode())
+        self.process.stdin.flush()
+        deadline = time.monotonic() + 10
+        header = b""
+        while not header.endswith(b"\r\n\r\n"):
+            header += self.read_bytes(1, deadline)
+            if len(header) > 16384:
+                raise CodexError("Invalid shared Codex server handshake")
+        expected = base64.b64encode(hashlib.sha1((key +
+            "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        fields = dict(line.split(":", 1) for line in header.decode().split("\r\n")[1:] if ":" in line)
+        fields = {k.lower(): v.strip() for k, v in fields.items()}
+        if not header.startswith(b"HTTP/1.1 101 ") or fields.get("sec-websocket-accept") != expected:
+            raise CodexError("Shared Codex server rejected the WebSocket handshake")
+
+    def read_frame_event(self, deadline):
+        while True:
+            first, second = self.read_bytes(2, deadline)
+            length = second & 127
+            if length == 126:
+                length = struct.unpack("!H", self.read_bytes(2, deadline))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self.read_bytes(8, deadline))[0]
+            if length > 64 * 1024 * 1024:
+                raise CodexError("Shared Codex server message is too large")
+            mask = self.read_bytes(4, deadline) if second & 128 else None
+            payload = self.read_bytes(length, deadline)
+            if mask:
+                payload = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+            opcode = first & 15
+            if opcode == 8:
+                raise CodexError("Shared Codex server closed the connection")
+            if opcode == 9:
+                self.send_frame(payload, 10)
+                continue
+            if opcode == 10:
+                continue
+            if opcode not in (0, 1):
+                raise CodexError("Unexpected shared Codex server frame")
+            self.fragments += payload
+            if len(self.fragments) > 64 * 1024 * 1024:
+                raise CodexError("Shared Codex server message is too large")
+            if first & 128:
+                payload, self.fragments = self.fragments, b""
+                return json.loads(payload)
 
     def request(self, method, params=None, timeout=30):
         self.serial += 1
@@ -45,27 +143,43 @@ class AppServer:
         self.send({"id": request_id, "method": method, "params": params or {}})
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            while b"\n" in self.buffer:
+            try:
+                event = self.read_event(deadline)
+            except TimeoutError as error:
+                raise CodexError(f"Timed out reading {method}") from error
+            if event.get("id") == request_id:
+                if "error" in event:
+                    raise CodexError(f"{method}: {event['error'].get('message', 'request failed')}")
+                return event["result"]
+            if "id" in event and "method" in event:
+                self.send({"id": event["id"], "error": {
+                    "code": -32601, "message": "Schedulex does not handle interactive requests"
+                }})
+            else:
+                self.notifications.append(event)
+        raise CodexError(f"Timed out reading {method}")
+
+    def read_event(self, deadline):
+        if self.shared:
+            return self.read_frame_event(deadline)
+        while True:
+            if b"\n" in self.buffer:
                 line, self.buffer = self.buffer.split(b"\n", 1)
-                if not line.strip():
-                    continue
-                event = json.loads(line)
-                if event.get("id") == request_id:
-                    if "error" in event:
-                        raise CodexError(f"{method}: {event['error'].get('message', 'request failed')}")
-                    return event["result"]
-                if "id" in event and "method" in event:
-                    self.send({"id": event["id"], "error": {
-                        "code": -32601, "message": "Schedulex does not handle interactive requests"
-                    }})
-            events = self.selector.select(max(0, deadline - time.monotonic()))
-            if events:
-                chunk = os.read(self.process.stdout.fileno(), 65536)
-                if not chunk:
-                    raise CodexError("Codex app-server exited before responding. Check `codex app-server` "
-                                     "locally for login or state-directory permission errors.")
-                self.buffer += chunk
-        raise CodexError(f"Timed out reading {method}; no task was started.")
+                if line.strip():
+                    return json.loads(line)
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not self.selector.select(remaining):
+                raise TimeoutError("Timed out waiting for Codex")
+            chunk = os.read(self.process.stdout.fileno(), 65536)
+            if not chunk:
+                raise CodexError("Codex app-server disconnected; inspect the chat before retrying")
+            self.buffer += chunk
+
+    def next_event(self, deadline):
+        if self.notifications:
+            return self.notifications.pop(0)
+        return self.read_event(deadline)
 
     def close(self):
         self.selector.close()
@@ -76,7 +190,10 @@ class AppServer:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait()
-        self.process.stdin.close()
+        try:
+            self.process.stdin.close()
+        except BrokenPipeError:
+            pass
         self.process.stdout.close()
 
 
@@ -145,12 +262,17 @@ def bucket(snapshot_value, limit_id="codex"):
 
 
 def five_hour_reset(value, limit_id="codex"):
+    return usage_reset(value, limit_id, "five-hour")
+
+
+def usage_reset(value, limit_id="codex", period="five-hour"):
+    minutes = {"five-hour": 300, "weekly": 10080}[period]
     selected = bucket(value, limit_id)
     for key in ("primary", "secondary"):
         window = selected.get(key)
-        if window and window.get("windowDurationMins") == 300 and window.get("resetsAt"):
-            return window["resetsAt"]
-    raise CodexError("No five-hour reset time is available; schedule with --at instead.")
+        if window and window.get("windowDurationMins") == minutes and window.get("resetsAt"):
+            return float(window["resetsAt"])
+    raise CodexError(f"No {period} reset time is available; waiting for Codex to report it.")
 
 
 def allowance(value, limit_id="codex", min_remaining=1):
@@ -168,14 +290,12 @@ def allowance(value, limit_id="codex", min_remaining=1):
     return True, "Ready"
 
 
-def command(binary, job, output):
-    args = [binary, "-a", "never", "exec", "--json", "--color", "never",
-            "--sandbox", job["sandbox"], "--cd", job["cwd"],
-            "--skip-git-repo-check", "--output-last-message", str(output),
-            "-c", 'model_provider="openai"', "-c", 'forced_login_method="chatgpt"']
-    if job["model"]:
-        args += ["--model", job["model"]]
-    if job.get("effort"):
-        args += ["-c", f"model_reasoning_effort={json.dumps(job['effort'])}"]
-    args.append("-")
-    return args
+def interrupt(binary, thread_id, turn_id):
+    server = AppServer(binary, shared=True)
+    try:
+        server.request("initialize", {"clientInfo": {
+            "name": "schedulex", "title": "Schedulex", "version": "0.2.0"}})
+        server.send({"method": "initialized", "params": {}})
+        server.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id}, timeout=10)
+    finally:
+        server.close()

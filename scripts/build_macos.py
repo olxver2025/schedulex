@@ -28,7 +28,7 @@ def build(destination=None):
                     str(contents / "MacOS" / "SchedulexPowerHelper")], check=True)
     info = {"CFBundleExecutable": "Schedulex", "CFBundleIdentifier": "local.schedulex.menubar",
             "CFBundleName": "Schedulex", "CFBundleDisplayName": "Schedulex", "CFBundlePackageType": "APPL",
-            "CFBundleShortVersionString": "0.3.0", "CFBundleVersion": "3", "LSMinimumSystemVersion": "14.0",
+            "CFBundleShortVersionString": "0.4.0", "CFBundleVersion": "4", "LSMinimumSystemVersion": "14.0",
             "LSUIElement": True, "NSHighResolutionCapable": True, "SchedulexArchitecture": architecture}
     (contents / "Info.plist").write_bytes(plistlib.dumps(info))
     subprocess.run(["codesign", "--force", "--sign", "-", str(destination)], check=True)

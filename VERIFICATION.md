@@ -1,5 +1,55 @@
 # Verification
 
+## Editing, completion alerts, and reset recurrence, version 0.4.0
+
+Verified on 6 October 2026.
+
+- All 55 Python tests pass. Coverage includes edits preserving IDs and unspecified
+  settings, rescheduling, clearing overrides, rejecting stale/running edits,
+  rollback on wake-service failure, and refusing a stale worker preflight.
+- Both five-hour and weekly recurrence use only the matching reported reset
+  timestamp. Tests cover distinct resets, unknown/stale timestamps, database
+  reopen, retained occurrence history, cancellation, missed resets without a
+  backlog, and stopping recurrence after failure or interruption.
+- Native composer integration checks pass against fake Codex with a temporary
+  queue and wake operations stubbed. They verify complete prompt transport,
+  editing/rescheduling, permission and gate changes, recurrence restoration,
+  both repeat periods, preserving captured resets, and notification filtering.
+- Completion events are presented separately from the ten recent task cards.
+  The native notification filter excludes historical/already delivered events
+  and labels Cloud submission separately from local completion. Upcoming
+  reminders retain a stable event identity even within their ten-minute lead.
+- Built and signed the native app and the 0.4.0 arm64 installer archive. Visually
+  inspected the native task panel, the weekly recurrence edit form, and the
+  one-shot composer; all new controls and save actions fit without clipping.
+- Updated the installed app and runtime to 0.4.0. Verified both user services are
+  running, the installed source matches the repository, the app passes strict
+  signature verification, and the existing queued task's ID, prompt, schedule,
+  and status are unchanged. The existing privileged wake helper was identical.
+- No real inference was used for these feature checks. A real multi-hour/week
+  reset wait, physical sleep/wake, and actual macOS completion-banner delivery
+  or notification click behavior were not exercised. Notifications require
+  macOS permission and are checked while the menu bar app runs; saved unseen
+  completion events are delivered when it next refreshes after reopening.
+
+
+## Weekly reset scheduling, 6 October 2026
+
+- Added **After weekly reset** to the native composer and `--after-weekly-reset`
+  to CLI task creation and editing. It uses the selected bucket's reported
+  10080-minute window and a 30-second buffer.
+- The dedicated weekly reset tests pass in the full suite. Seven weekly
+  reset tests cover window selection, legacy responses, selected buckets, local
+  and Cloud tasks, editing, wake requests, missing timestamps, exclusive schedule
+  flags, and worker time/allowance gates.
+- Native composer integration checks pass against fake Codex in a temporary
+  queue with system wake operations stubbed. Both five-hour and weekly reset
+  tasks were saved, inspected, and cancelled without inference.
+- Native app builds and passes strict signature verification. Visually inspected
+  the native composer with **After weekly reset** selected.
+- The installed runtime was not updated by this change. A real multi-day reset
+  wait and physical sleep/wake were not exercised.
+
 Verified on macOS on 6 October 2026 with Python 3.14.7 and Codex CLI 0.160.0.
 
 - 21 automated tests passed using an actual fake-Codex subprocess: app-server
@@ -78,3 +128,23 @@ behavior relied on persistent jobs being checked when the worker next ran.
   passes `codesign --verify --deep --strict`.
 - No Schedulex job was queued during installation, so no timed wake event was added.
   Actual sleep/wake behavior, display state, and post-task sleep remain unverified.
+
+## Codex chat visibility, 6 October 2026
+
+- Local dispatch now uses the shared Codex app-server daemon through the CLI proxy,
+  with a verified WebSocket upgrade and masked client frames. Chats persist with
+  `threadSource=user`; job records retain thread and turn IDs. Existing queue
+  databases migrate in place. No hidden `exec` fallback is used.
+- Ran a real read-only completion test. The Codex app's `list_threads` returned
+  **ScheduleX visibility verification**, including its saved prompt and result.
+- Ran the actual ScheduleX worker against a temporary queue, then interrupted its
+  real turn from a second server connection. The worker recorded `interrupted`.
+- This installed desktop app uses a separate server and reports daemon-owned runs
+  as `notLoaded`. Its native stop button could not be verified (Computer Use also
+  disallows inspecting Codex). Use ScheduleX's new **Interrupt** action or
+  `schx interrupt JOB_ID` to stop a live run; **Open in Codex** opens saved history.
+- 34 Python tests pass, including prompt/permission/effort transport over the
+  WebSocket proxy, timeout interruption RPC, externally interrupted completion,
+  and no retries after failures. The native app builds and signs successfully.
+- Build output updated; the installed runtime is unchanged. Run the installer to
+  apply these repository changes to the installed worker and menu bar app.

@@ -56,30 +56,45 @@ def parser():
     p.add_argument("--state-dir", default=os.environ.get("SCHEDULEX_HOME", "~/.local/share/schedulex"))
     p.add_argument("--codex", default=os.environ.get("SCHEDULEX_CODEX", "codex"), help="Codex executable")
     commands = p.add_subparsers(dest="command", required=True)
-    add = commands.add_parser("add", help="Schedule a prompt; omission of prompt reads stdin")
-    add.add_argument("prompt", nargs="?", help="Complete prompt (quote multiline text)")
-    add.add_argument("--prompt-file", type=Path, help="UTF-8 file; '-' reads stdin")
-    when = add.add_mutually_exclusive_group(required=True)
-    when.add_argument("--at", help="ISO time with offset, or +30m / +2h / +1d")
-    when.add_argument("--after-reset", action="store_true", help="Next reported five-hour reset")
-    add.add_argument("--cwd", type=Path, default=Path.cwd(), help="Workspace to run in")
-    add.add_argument("--cloud-env", help="Submit to this configured Codex Cloud environment when due")
-    add.add_argument("--window", type=window, help="Allowed start hours, e.g. 23:00-07:00")
-    add.add_argument("--timezone", default="Europe/London", help="IANA timezone for allowed hours")
-    add.add_argument("--idle-minutes", type=positive, default=0, help="Require Mac keyboard/mouse inactivity before starting")
-    add.add_argument("--sandbox", choices=("read-only", "workspace-write"), default="read-only",
-                     help="Explicitly grant workspace writes with workspace-write")
-    add.add_argument("--model", help="Optional model; otherwise uses your Codex default")
-    add.add_argument("--effort", "--reasoning-effort",
-                     help="Reasoning effort (model-dependent); omitted uses your Codex default")
-    add.add_argument("--limit-id", default="codex", help="Usage bucket; use limits to inspect available buckets")
-    add.add_argument("--min-remaining", type=float, default=1, help="Required remaining percent in every reported window")
-    add.add_argument("--timeout", type=positive, default=7200, help="Maximum task runtime in seconds")
+    for command in ("add", "edit"):
+        editing = command == "edit"
+        add = commands.add_parser(command, help="Edit/reschedule a pending task" if editing else
+                                  "Schedule a prompt; omission of prompt reads stdin")
+        def option_default(value):
+            return argparse.SUPPRESS if editing else value
+        if editing:
+            add.add_argument("id")
+            add.add_argument("--revision", type=int, help="Reject edits if the task has changed")
+        add.add_argument("prompt", nargs="?", default=option_default(None), help="Complete prompt")
+        add.add_argument("--prompt-file", type=Path, default=option_default(None), help="UTF-8 file; '-' reads stdin")
+        when = add.add_mutually_exclusive_group(required=not editing)
+        when.add_argument("--at", default=option_default(None), help="ISO time with offset, or +30m / +2h / +1d")
+        when.add_argument("--after-reset", action="store_true", default=option_default(False), help="Next reported five-hour reset")
+        when.add_argument("--after-weekly-reset", action="store_true", default=option_default(False), help="Next reported weekly limit reset")
+        when.add_argument("--repeat-reset", choices=("five-hour", "weekly", "none") if editing else ("five-hour", "weekly"),
+                          default=option_default(None), help="Repeat after each reported reset; no clock-based intervals")
+        add.add_argument("--project", "--cwd", dest="cwd", type=Path, default=option_default(Path.cwd()))
+        add.add_argument("--cloud-env", default=option_default(None))
+        add.add_argument("--window", type=window, default=option_default(None))
+        add.add_argument("--timezone", default=option_default("Europe/London"))
+        add.add_argument("--idle-minutes", type=positive, default=option_default(0))
+        add.add_argument("--sandbox", choices=("read-only", "workspace-write"), default=option_default("read-only"))
+        add.add_argument("--model", default=option_default(None))
+        add.add_argument("--effort", "--reasoning-effort", default=option_default(None))
+        add.add_argument("--limit-id", default=option_default("codex"))
+        add.add_argument("--min-remaining", type=float, default=option_default(1))
+        add.add_argument("--timeout", type=positive, default=option_default(7200))
+        if editing:
+            for field in ("window", "idle", "model", "effort"):
+                add.add_argument(f"--clear-{field}", action="store_true")
+            add.add_argument("--local", action="store_true", help="Switch from Cloud to a local project")
     commands.add_parser("list", help="Show queue and job states")
     show = commands.add_parser("show", help="Show complete prompt, status and run paths")
     show.add_argument("id")
     cancel = commands.add_parser("cancel", help="Cancel a pending job")
     cancel.add_argument("id")
+    interrupt = commands.add_parser("interrupt", help="Interrupt a running local Codex task")
+    interrupt.add_argument("id")
     commands.add_parser("limits", help="Read live subscription usage and reset times (no inference)")
     commands.add_parser("dashboard", help="JSON status for the menu bar app")
     commands.add_parser("models", help="List live models and their supported reasoning efforts")
@@ -93,53 +108,116 @@ def parser():
     return p
 
 
-def add_job(args, store):
-    if args.prompt is not None and args.prompt_file is not None:
+def save_job(args, store):
+    editing = args.command == "edit"
+    row = store.get(args.id) if editing else None
+    if row and row["status"] != "pending":
+        raise ValueError("Only pending tasks can be edited or rescheduled")
+    spec = json.loads(row["spec"]) if row else {}
+    supplied = vars(args)
+    prompt_arg = supplied.get("prompt")
+    prompt_file = supplied.get("prompt_file")
+    if prompt_arg is not None and prompt_file is not None:
         raise ValueError("Choose a prompt argument or --prompt-file")
-    if args.prompt_file and str(args.prompt_file) != "-":
-        prompt = args.prompt_file.read_text(encoding="utf-8")
-    elif args.prompt is not None:
-        prompt = args.prompt
-    else:
+    if prompt_file and str(prompt_file) != "-":
+        spec["prompt"] = prompt_file.read_text(encoding="utf-8")
+    elif prompt_arg is not None:
+        spec["prompt"] = prompt_arg
+    elif prompt_file or not editing:
         if sys.stdin.isatty():
             print("Type your complete prompt, then press Ctrl-D:", file=sys.stderr)
-        prompt = sys.stdin.read()
-    if not prompt.strip():
+        spec["prompt"] = sys.stdin.read()
+    if not spec.get("prompt", "").strip():
         raise ValueError("Prompt cannot be empty")
-    cwd = args.cwd.expanduser().resolve()
-    if not args.cloud_env and not cwd.is_dir():
-        raise ValueError("--cwd must be an existing directory")
-    cloud_env = args.cloud_env.strip() if args.cloud_env else None
-    if args.cloud_env and not cloud_env:
-        raise ValueError("--cloud-env cannot be empty")
-    ZoneInfo(args.timezone)
-    if args.idle_minutes and sys.platform != "darwin":
+    for field in ("sandbox", "model", "effort", "window", "timezone", "idle_minutes",
+                  "min_remaining", "limit_id", "timeout", "cloud_env"):
+        if field in supplied:
+            spec[field] = supplied[field]
+    for field, target in (("window", "window"), ("idle", "idle_minutes"), ("model", "model"), ("effort", "effort")):
+        if supplied.get("clear_" + field):
+            if target in supplied:
+                raise ValueError(f"Choose --clear-{field} or an override, not both")
+            spec[target] = 0 if field == "idle" else None
+    if supplied.get("local"):
+        if supplied.get("cloud_env"):
+            raise ValueError("Choose --local or --cloud-env")
+        spec["cloud_env"] = None
+    cloud_env = spec.get("cloud_env")
+    if cloud_env is not None:
+        cloud_env = cloud_env.strip()
+        if not cloud_env:
+            raise ValueError("--cloud-env cannot be empty")
+    spec["cloud_env"] = cloud_env
+    spec["destination"] = "cloud" if cloud_env else "local"
+    if "cwd" in supplied:
+        spec["cwd"] = str(supplied["cwd"].expanduser().resolve())
+    if not cloud_env:
+        if not spec.get("cwd") or not Path(spec["cwd"]).is_dir():
+            raise ValueError("--project/--cwd must be an existing directory")
+    else:
+        spec["cwd"] = None
+    ZoneInfo(spec["timezone"])
+    if spec["idle_minutes"] and sys.platform != "darwin":
         raise ValueError("--idle-minutes currently requires macOS; use --window on other platforms")
-    if not 0 < args.min_remaining <= 100:
+    if not 0 < spec["min_remaining"] <= 100:
         raise ValueError("--min-remaining must be greater than 0 and at most 100")
-    if args.after_reset:
-        due = max(time.time(), codex.five_hour_reset(codex.snapshot(codex.executable(args.codex)), args.limit_id)) + 30
-    else:
+    due = row["due"] if row else None
+    recurrence = supplied.get("repeat_reset")
+    if (editing and recurrence is None and not supplied.get("at") and not supplied.get("after_reset")
+            and not supplied.get("after_weekly_reset") and spec.get("recurrence")
+            and json.loads(row["spec"]).get("limit_id") != spec["limit_id"]):
+        recurrence = spec["recurrence"]
+    if recurrence in ("five-hour", "weekly"):
+        # Editing the same series preserves its current occurrence and reset identity.
+        same = (editing and spec.get("recurrence") == recurrence and
+                json.loads(row["spec"]).get("limit_id") == spec["limit_id"])
+        spec["recurrence"] = recurrence
+        spec["schedule"] = "repeat-reset"
+        if not same:
+            reset = codex.usage_reset(codex.snapshot(codex.executable(args.codex)), spec["limit_id"], recurrence)
+            if reset <= time.time():
+                raise ValueError("Codex has not reported a future reset yet; try again after refreshing usage")
+            spec["reset_at"] = reset
+            spec.pop("recurrence_after", None)
+            due = reset + 30
+    elif supplied.get("after_reset") or supplied.get("after_weekly_reset"):
+        spec["recurrence"] = None
+        weekly = supplied.get("after_weekly_reset")
+        spec["schedule"] = "after-weekly-reset" if weekly else "after-reset"
+        spec["reset_at"] = codex.usage_reset(codex.snapshot(codex.executable(args.codex)), spec["limit_id"],
+                                            "weekly" if weekly else "five-hour")
+        due = max(time.time(), spec["reset_at"]) + 30
+    elif supplied.get("at"):
+        spec["recurrence"] = None
+        spec["schedule"] = "at"
+        spec["reset_at"] = None
         due = parse_time(args.at)
-    spec = {"prompt": prompt, "cwd": str(cwd) if not cloud_env else None,
-            "destination": "cloud" if cloud_env else "local", "cloud_env": cloud_env,
-            "sandbox": args.sandbox,
-            "model": args.model, "effort": args.effort, "window": args.window, "timezone": args.timezone,
-            "idle_minutes": args.idle_minutes, "min_remaining": args.min_remaining,
-            "limit_id": args.limit_id, "timeout": args.timeout,
-            "schedule": "after-reset" if args.after_reset else "at"}
-    job_id = store.add(spec, due)
-    if sys.platform == "darwin":
-        try:
-            power.schedule_wake(job_id, max(due, time.time() + 15))
-        except power.PowerError as error:
-            store.remove_pending(job_id)
-            raise ValueError(f"Could not schedule the Mac wake; install the background service first. {error}") from error
-    destination = f"Codex Cloud environment {cloud_env}" if cloud_env else args.sandbox
-    print(f"Scheduled {job_id} for {timestamp(due)} ({destination})")
-    if sys.platform == "darwin":
-        print("Schedulex will wake this Mac at the scheduled time and keep it awake while local Codex runs.")
+    elif recurrence == "none":
+        spec["recurrence"] = None
+        spec["schedule"] = "at"
+        spec["reset_at"] = None
+    def wake():
+        if sys.platform == "darwin":
+            try:
+                power.schedule_wake(job_id, max(due, time.time() + 15))
+            except power.PowerError as error:
+                raise ValueError(f"Could not schedule the Mac wake; task was not saved. {error}") from error
+    if editing:
+        job_id = args.id
+        revision = supplied.get("revision")
+        if revision is None:
+            revision = row["revision"]
+        store.update_pending(job_id, spec, due, revision, before_commit=wake)
     else:
+        job_id = store.add(spec, due)
+        try:
+            wake()
+        except ValueError:
+            store.remove_pending(job_id)
+            raise
+    destination = f"Codex Cloud environment {cloud_env}" if cloud_env else spec["sandbox"]
+    print(f"{'Updated' if editing else 'Scheduled'} {job_id} for {timestamp(due)} ({destination})")
+    if not editing:
         print("Run `schedulex worker` or install the background worker with `schedulex service install`.")
 
 
@@ -225,8 +303,8 @@ def main(argv=None):
         if args.command == "dashboard":
             from .dashboard import dashboard
             print(json.dumps(dashboard(store, args.codex), ensure_ascii=False))
-        elif args.command == "add":
-            add_job(args, store)
+        elif args.command in ("add", "edit"):
+            save_job(args, store)
         elif args.command == "list":
             for row in store.jobs():
                 print(f"{row['id']}  {row['status']:12}  {timestamp(row['due'])}  {row['note']}")
@@ -235,6 +313,12 @@ def main(argv=None):
             row["spec"] = json.loads(row["spec"])
             row["runs"] = str(store.root / "runs" / args.id)
             print(json.dumps(row, indent=2, ensure_ascii=False))
+        elif args.command == "interrupt":
+            row = store.get(args.id)
+            if row["status"] != "running" or not row.get("thread_id") or not row.get("turn_id"):
+                raise ValueError("This task does not have a running local Codex turn")
+            codex.interrupt(codex.executable(args.codex), row["thread_id"], row["turn_id"])
+            print("Interruption requested; the worker will record the final status")
         elif args.command == "cancel":
             store.cancel(args.id)
             try:
@@ -247,7 +331,7 @@ def main(argv=None):
             run(store, codex.executable(args.codex), args.once, args.interval)
         elif args.command == "service":
             service(args, store)
-    except (codex.CodexError, ValueError, OSError, KeyError) as error:
+    except (codex.CodexError, ValueError, OSError, KeyError, TimeoutError) as error:
         print(f"schedulex: {error}", file=sys.stderr)
         raise SystemExit(1)
     finally:

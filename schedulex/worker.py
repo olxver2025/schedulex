@@ -76,54 +76,80 @@ def stop_process(process):
 
 
 def execute(store, binary, row):
-    spec = json.loads(row["spec"])
-    if not store.claim(row["id"]):
+    if not store.claim(row["id"], row["revision"]):
         return
+    spec = json.loads(store.get(row["id"])["spec"])
     power.cancel_wake(row["id"], quiet=True)
     print(f"Starting {row['id']} in {spec['cwd']}", flush=True)
-    process = None
+    server = None
+    thread_id = turn_id = None
     awake_guard = None
     try:
         logs = store.root / "runs" / row["id"]
         logs.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # A new run only starts once. Nonzero exits may already have changed files.
-        with (logs / "events.jsonl").open("wb") as stdout, (logs / "stderr.log").open("wb") as stderr:
-            process = subprocess.Popen(codex.command(binary, spec, logs / "answer.txt"),
-                                       stdin=subprocess.PIPE, stdout=stdout, stderr=stderr,
-                                       start_new_session=True, cwd=spec["cwd"], env=codex.subscription_env())
-            if sys.platform == "darwin":
-                awake_guard = subprocess.Popen(["/usr/bin/caffeinate", "-i", "-w", str(process.pid)],
-                                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                               stderr=subprocess.DEVNULL)
-            try:
-                process.communicate(spec["prompt"].encode(), timeout=spec["timeout"])
-            except subprocess.TimeoutExpired:
-                stop_process(process)
-                store.finish(row["id"], "interrupted", process.returncode,
-                             "Task timed out; inspect changes before scheduling again")
-                return
-        event_failure = False
-        completed = False
-        with (logs / "events.jsonl").open() as stream:
-            for line in stream:
-                try:
-                    event = json.loads(line)
-                except ValueError:
+        server = codex.AppServer(binary, shared=True)
+        if sys.platform == "darwin":
+            awake_guard = subprocess.Popen(["/usr/bin/caffeinate", "-i", "-w", str(server.process.pid)],
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        server.request("initialize", {"clientInfo": {
+            "name": "schedulex", "title": "Schedulex", "version": "0.2.0"}})
+        server.send({"method": "initialized", "params": {}})
+        config = {"forced_login_method": "chatgpt"}
+        if spec.get("effort"):
+            config["model_reasoning_effort"] = spec["effort"]
+        thread = server.request("thread/start", {
+            "cwd": spec["cwd"], "model": spec.get("model"), "modelProvider": "openai",
+            "approvalPolicy": "never", "sandbox": spec["sandbox"], "config": config,
+            "ephemeral": False, "threadSource": "user"})["thread"]
+        thread_id = thread["id"]
+        store.set_thread(row["id"], thread_id)
+        server.request("thread/name/set", {"threadId": thread_id,
+                       "name": "ScheduleX: " + spec["prompt"].strip().splitlines()[0][:80]})
+        deadline = time.monotonic() + spec["timeout"]
+        turn_id = server.request("turn/start", {"threadId": thread_id,
+            "input": [{"type": "text", "text": spec["prompt"], "text_elements": []}],
+            "effort": spec.get("effort")})["turn"]["id"]
+        store.set_turn(row["id"], turn_id)
+        with (logs / "events.jsonl").open("w") as events, (logs / "stderr.log").open("w"):
+            while True:
+                event = server.next_event(deadline)
+                events.write(json.dumps(event) + "\n")
+                events.flush()
+                params = event.get("params", {})
+                if params.get("threadId") != thread_id:
                     continue
-                if event.get("type") in ("turn.failed", "error"):
-                    event_failure = True
-                if event.get("type") == "turn.completed":
-                    completed = True
-        success = process.returncode == 0 and completed and not event_failure
-        store.finish(row["id"], "succeeded" if success else "failed", process.returncode,
-                     "" if success else "Inspect logs and workspace; task is not automatically retried")
-        print(f"{row['id']}: {'succeeded' if success else 'failed'}; results in {logs}", flush=True)
-    except BaseException:
-        if process is not None:
-            stop_process(process)
-        store.finish(row["id"], "interrupted", note="Worker stopped; inspect changes before scheduling again")
-        raise
+                if "id" in event and "method" in event:
+                    server.send({"id": event["id"], "error": {
+                        "code": -32601, "message": "Scheduled tasks cannot request interactive input"}})
+                if event.get("method") == "item/completed":
+                    item = params.get("item", {})
+                    if item.get("type") == "agentMessage" and params.get("turnId") == turn_id:
+                        (logs / "answer.txt").write_text(item.get("text", ""))
+                if event.get("method") == "turn/completed" and params.get("turn", {}).get("id") == turn_id:
+                    status = params["turn"]["status"]
+                    outcome = {"completed": "succeeded", "interrupted": "interrupted"}.get(status, "failed")
+                    store.finish(row["id"], outcome, 0 if outcome == "succeeded" else None,
+                                 "" if outcome == "succeeded" else "Review the Codex chat before scheduling again")
+                    print(f"{row['id']}: {outcome}; Codex chat {thread_id}", flush=True)
+                    return
+    except BaseException as error:
+        if server is not None and thread_id is not None:
+            try:
+                # The daemon owns the turn: killing the proxy alone would leave it running.
+                if turn_id is None:
+                    turns = server.request("thread/read", {"threadId": thread_id, "includeTurns": True}, timeout=10)["thread"].get("turns", [])
+                    if turns:
+                        turn_id = turns[-1]["id"]
+                if turn_id is not None:
+                    server.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id}, timeout=10)
+            except (codex.CodexError, OSError, TimeoutError):
+                pass
+        store.finish(row["id"], "interrupted", note=f"Task stopped: {error}; review the Codex chat before retrying")
+        if not isinstance(error, (TimeoutError, codex.CodexError, OSError)):
+            raise
     finally:
+        if server is not None:
+            server.close()
         if awake_guard is not None:
             try:
                 awake_guard.wait(timeout=3)
@@ -132,9 +158,9 @@ def execute(store, binary, row):
 
 
 def submit_cloud(store, binary, row):
-    spec = json.loads(row["spec"])
-    if not store.claim(row["id"]):
+    if not store.claim(row["id"], row["revision"]):
         return
+    spec = json.loads(store.get(row["id"])["spec"])
     power.cancel_wake(row["id"], quiet=True)
     print(f"Submitting {row['id']} to Codex Cloud ({spec['cloud_env']})", flush=True)
     args = [binary, "cloud", "exec", "--env", spec["cloud_env"]]
@@ -164,12 +190,39 @@ def submit_cloud(store, binary, row):
         store.finish(row["id"], "failed", note=f"Could not submit to Codex Cloud: {error}")
 
 
+def arm_recurrences(store, binary, now):
+    """Discover future resets without deriving either interval from wall-clock time."""
+    value = None
+    for row in store.jobs(pending=True):
+        spec = json.loads(row["spec"])
+        if not spec.get("recurrence") or spec.get("reset_at") is not None:
+            continue
+        try:
+            if value is None:
+                value = codex.snapshot(binary)
+            reset = codex.usage_reset(value, spec["limit_id"], spec["recurrence"])
+            if reset <= max(now, spec.get("recurrence_after", 0)):
+                raise codex.CodexError("Waiting for a new reported usage reset")
+            spec["reset_at"] = reset
+            store.update_pending(row["id"], spec, reset + 30, row["revision"])
+            reschedule_wake(row["id"], reset + 30, "next usage reset")
+        except (codex.CodexError, OSError, ValueError) as error:
+            current = store.get(row["id"])
+            if current["status"] != "pending" or current["revision"] != row["revision"]:
+                continue
+            store.note(row["id"], str(error))
+            reschedule_wake(row["id"], now + 300, "next usage reset unavailable")
+
+
 def tick(store, binary, now=None):
     now = time.time() if now is None else now
+    arm_recurrences(store, binary, now)
     for row in store.jobs(pending=True):
         if row["due"] > now:
             continue
         spec = json.loads(row["spec"])
+        if spec.get("recurrence") and spec.get("reset_at") is None:
+            continue
         if not in_window(spec["window"], spec["timezone"], now):
             store.note(row["id"], "Waiting for allowed hours")
             reschedule_wake(row["id"], next_window_start(spec["window"], spec["timezone"], now),
@@ -203,6 +256,8 @@ def tick(store, binary, now=None):
             submit_cloud(store, binary, row)
         else:
             execute(store, binary, row)
+        # Arrange the next wake before releasing this run's opportunity to dispatch.
+        arm_recurrences(store, binary, time.time())
         return True
     return False
 
@@ -222,6 +277,11 @@ def run(store, binary, once=False, interval=60):
         # A crashed worker's task may have made changes. Never duplicate its execution.
         for row in store.jobs():
             if row["status"] == "running":
+                if row.get("thread_id") and row.get("turn_id"):
+                    try:
+                        codex.interrupt(binary, row["thread_id"], row["turn_id"])
+                    except (codex.CodexError, OSError, TimeoutError) as error:
+                        print(f"Could not interrupt previous Codex turn: {error}", flush=True)
                 store.finish(row["id"], "interrupted", note="Previous worker stopped; review workspace and logs")
         while True:
             tick(store, binary)

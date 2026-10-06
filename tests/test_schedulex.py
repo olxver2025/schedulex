@@ -89,14 +89,20 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(tick(self.store, str(self.fake)))
         self.assertEqual(self.store.get(job)["status"], "succeeded")
         logs = self.store.root / "runs" / job
-        self.assertEqual((logs / "received.txt").read_text(), self.spec()["prompt"])
-        args = json.loads((logs / "argv.json").read_text())
-        self.assertIn("workspace-write", args)
-        self.assertIn("never", args)
-        self.assertIn("example-model", args)
-        self.assertIn('model_reasoning_effort="high"', args)
-        self.assertIn('model_provider="openai"', args)
-        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", args)
+        events = [json.loads(line) for line in (logs / "events.jsonl").read_text().splitlines()]
+        transport = next(e["params"] for e in events if e.get("method") == "fixture/transport")
+        self.assertEqual(transport["turn"]["input"][0]["text"], self.spec()["prompt"])
+        thread = transport["thread"]
+        self.assertEqual(thread["sandbox"], "workspace-write")
+        self.assertEqual(thread["approvalPolicy"], "never")
+        self.assertEqual(thread["model"], "example-model")
+        self.assertEqual(thread["config"]["model_reasoning_effort"], "high")
+        self.assertEqual(thread["modelProvider"], "openai")
+        self.assertEqual(thread["threadSource"], "user")
+        self.assertFalse(thread["ephemeral"])
+        self.assertIn("proxy", transport["argv"])
+        self.assertEqual(self.store.get(job)["thread_id"], "fixture-thread")
+        self.assertEqual((logs / "answer.txt").read_text(), "done")
         self.assertFalse(tick(self.store, str(self.fake)))
 
     def test_model_catalog_and_effort_defaults(self):
@@ -104,8 +110,12 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(value["models"][0]["efforts"], ["low", "high"])
         self.assertEqual(value["defaultModel"], "example-model")
         self.assertEqual(value["defaultEffort"], "high")
-        command = codex.command(str(self.fake), self.spec(), self.root / "answer.txt")
-        self.assertFalse(any("model_reasoning_effort=" in part for part in command))
+        job = self.add()
+        tick(self.store, str(self.fake))
+        events = [json.loads(line) for line in (self.store.root / "runs" / job / "events.jsonl").read_text().splitlines()]
+        transport = next(e["params"] for e in events if e.get("method") == "fixture/transport")
+        self.assertNotIn("model_reasoning_effort", transport["thread"]["config"])
+        self.assertIsNone(transport["turn"]["effort"])
 
     def test_cli_model_and_effort_are_saved(self):
         with contextlib.redirect_stdout(io.StringIO()):
@@ -133,15 +143,34 @@ class SchedulerTests(unittest.TestCase):
             with self.subTest(mode=mode), patch.dict(os.environ, {"FAKE_MODE": mode}):
                 job = self.add()
                 tick(self.store, str(self.fake))
-                self.assertEqual(self.store.get(job)["status"], "failed")
+                self.assertEqual(self.store.get(job)["status"], "interrupted" if mode == "incomplete" else "failed")
                 self.assertFalse(tick(self.store, str(self.fake)))
 
     def test_timeout_does_not_retry(self):
         job = self.add(timeout=1)
-        with patch.dict(os.environ, {"FAKE_MODE": "slow"}):
+        trace = self.root / "rpc.jsonl"
+        with patch.dict(os.environ, {"FAKE_MODE": "slow", "FAKE_RPC_LOG": str(trace)}):
+            tick(self.store, str(self.fake))
+        requests = [json.loads(line) for line in trace.read_text().splitlines()]
+        interruption = next(r for r in requests if r["method"] == "turn/interrupt")
+        self.assertEqual(interruption["params"], {"threadId": "fixture-thread", "turnId": "fixture-turn"})
+        self.assertEqual(self.store.get(job)["status"], "interrupted")
+        self.assertFalse(tick(self.store, str(self.fake)))
+
+    def test_external_interruption_status_and_cli(self):
+        job = self.add()
+        with patch.dict(os.environ, {"FAKE_MODE": "interrupted"}):
             tick(self.store, str(self.fake))
         self.assertEqual(self.store.get(job)["status"], "interrupted")
         self.assertFalse(tick(self.store, str(self.fake)))
+        running = self.add()
+        self.store.claim(running)
+        self.store.set_thread(running, "fixture-thread")
+        self.store.set_turn(running, "fixture-turn")
+        trace = self.root / "rpc.jsonl"
+        with patch.dict(os.environ, {"FAKE_RPC_LOG": str(trace)}), contextlib.redirect_stdout(io.StringIO()):
+            main(["--state-dir", str(self.store.root), "--codex", str(self.fake), "interrupt", running])
+        self.assertTrue(any(json.loads(line)["method"] == "turn/interrupt" for line in trace.read_text().splitlines()))
 
     def test_recover_interrupted_running_job(self):
         job = self.add()
@@ -224,6 +253,7 @@ class SchedulerTests(unittest.TestCase):
         with patch("schedulex.cli.sys.platform", "darwin"), patch("schedulex.cli.Path.home", return_value=self.root), \
                 patch("schedulex.cli.power.find_helper_binary", return_value=self.fake), \
                 patch("schedulex.cli.power.install_helper"), \
+                patch("schedulex.cli.power.cancel_all_wakes"), \
                 patch("schedulex.cli.subprocess.run") as launchctl, contextlib.redirect_stdout(io.StringIO()):
             launchctl.return_value = subprocess.CompletedProcess([], 0, "loaded", "")
             service(args, self.store)

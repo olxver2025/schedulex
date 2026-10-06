@@ -49,12 +49,28 @@ def dashboard(store, binary):
         jobs.append({"id": row["id"], "prompt": spec["prompt"], "status": row["status"],
                      "due": row["due"], "cwd": spec.get("cwd"), "note": row["note"],
                      "destination": spec.get("destination", "local"),
+                     "threadId": row.get("thread_id"),
+                     "canInterrupt": row["status"] == "running" and bool(row.get("turn_id")),
+                     "codexUrl": "codex://threads/" + row["thread_id"] if row.get("thread_id") else None,
                      "cloudEnv": spec.get("cloud_env"), "cloudUrl": row.get("cloud_url"),
                      "window": spec.get("window"), "timezone": spec.get("timezone"),
+                     "sandbox": spec.get("sandbox", "read-only"),
+                     "idleMinutes": spec.get("idle_minutes", 0),
+                     "minRemaining": spec.get("min_remaining", 1),
+                     "limitId": spec.get("limit_id", "codex"), "timeout": spec.get("timeout", 7200),
+                     "schedule": spec.get("schedule", "at"), "recurrence": spec.get("recurrence"),
+                     "resetKnown": not spec.get("recurrence") or spec.get("reset_at") is not None,
+                     "revision": row["revision"],
                      "runs": str(store.root / "runs" / row["id"]),
                      "model": spec.get("model"), "effort": spec.get("effort")})
     result = {"jobs": jobs, "workerRunning": worker_running(store), "stateDir": str(store.root),
-              "checkedAt": time.time(), "usage": None, "usageError": None}
+              "checkedAt": time.time(), "usage": None, "usageError": None,
+              "completions": [{"id": row["id"], "status": row["status"], "finished": row["finished"],
+                               "prompt": json.loads(row["spec"])["prompt"],
+                               "url": "codex://threads/" + row["thread_id"] if row.get("thread_id") else row.get("cloud_url"),
+                               "runs": str(store.root / "runs" / row["id"])}
+                              for row in rows if row["finished"] is not None and
+                              row["status"] in ("succeeded", "failed", "interrupted", "submitted")]}
     try:
         result["usage"] = usage(codex.snapshot(codex.executable(binary)))
     except (codex.CodexError, OSError, ValueError) as error:

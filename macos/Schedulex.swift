@@ -1,6 +1,8 @@
 import AppKit
 import SwiftUI
 import Observation
+import UserNotifications
+import UniformTypeIdentifiers
 
 struct Configuration: Codable, Sendable {
     let python: String
@@ -33,6 +35,17 @@ struct ScheduledJob: Codable, Identifiable, Sendable {
     let destination: String?
     let cloudEnv: String?
     let cloudUrl: String?
+    let codexUrl: String?
+    let canInterrupt: Bool?
+    var sandbox: String? = nil
+    var idleMinutes: Int? = nil
+    var minRemaining: Double? = nil
+    var limitId: String? = nil
+    var timeout: Int? = nil
+    var schedule: String? = nil
+    var recurrence: String? = nil
+    var resetKnown: Bool? = nil
+    var revision: Int? = nil
 }
 
 struct UsageWindow: Codable, Identifiable, Sendable {
@@ -64,13 +77,197 @@ struct Dashboard: Codable, Sendable {
     let checkedAt: Double
     let usage: Usage?
     let usageError: String?
+    var completions: [CompletionNotice]? = nil
+}
+
+struct CompletionNotice: Codable, Sendable {
+    let id: String
+    let status: String
+    let finished: Double
+    let prompt: String
+    let url: String?
+    let runs: String
+
+    var title: String {
+        switch status {
+        case "succeeded": "Task completed"
+        case "failed": "Task failed"
+        case "interrupted": "Task interrupted"
+        case "submitted": "Task submitted to Codex Cloud"
+        default: "Task finished"
+        }
+    }
+
+    static func pending(_ notices: [CompletionNotice], since: Double, seen: Set<String>) -> [CompletionNotice] {
+        notices.filter { $0.finished > since && !seen.contains($0.id) &&
+            ["succeeded", "failed", "interrupted", "submitted"].contains($0.status) }
+    }
+}
+
+private struct NotificationTarget {
+    let fireAt: Date
+    let eventAt: Double
+    let title: String
+    let body: String
+
+    var signature: String {
+        "\(Int(eventAt.rounded()))|\(title)|\(body)"
+    }
+}
+
+@MainActor
+private final class NotificationCoordinator: NSObject, UNUserNotificationCenterDelegate {
+    private let center = UNUserNotificationCenter.current()
+    private let defaults = UserDefaults.standard
+    private let storageKey = "schedulex.notificationSignatures"
+    private let leadTime: TimeInterval = 10 * 60
+    private var isSyncing = false
+
+    override init() {
+        super.init()
+        center.delegate = self
+    }
+
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                            willPresent notification: UNNotification,
+                                            withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+        completionHandler([.banner, .list, .sound])
+    }
+
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                            didReceive response: UNNotificationResponse,
+                                            withCompletionHandler completionHandler: @escaping () -> Void) {
+        let target = response.notification.request.content.userInfo["target"] as? String
+        Task { @MainActor in
+            if let target, let url = URL(string: target),
+               ["codex", "https", "file"].contains(url.scheme ?? "") {
+                NSWorkspace.shared.open(url)
+            }
+            completionHandler()
+        }
+    }
+
+    private func syncCompletions(_ dashboard: Dashboard, key: String, since: Double) async {
+        let seenKey = "schedulex.completed." + key
+        var seen = Set(defaults.stringArray(forKey: seenKey) ?? [])
+        for notice in CompletionNotice.pending(dashboard.completions ?? [], since: since, seen: seen) {
+            let content = UNMutableNotificationContent()
+            content.title = notice.title
+            content.body = String((notice.prompt.split(separator: "\n").first.map(String.init) ?? "Scheduled task").prefix(140))
+            content.sound = .default
+            let folder = FileManager.default.fileExists(atPath: notice.runs) ? notice.runs : dashboard.stateDir
+            content.userInfo = ["target": notice.url ?? URL(fileURLWithPath: folder).absoluteString]
+            do {
+                try await center.add(UNNotificationRequest(identifier: "completion-" + key + "-" + notice.id,
+                                                          content: content, trigger: nil))
+                seen.insert(notice.id)
+                defaults.set(Array(seen), forKey: seenKey)
+            } catch {
+                // Leave this occurrence unseen so a later refresh can retry delivery.
+            }
+        }
+    }
+
+    func sync(_ dashboard: Dashboard) async {
+        guard !isSyncing else { return }
+        isSyncing = true
+        defer { isSyncing = false }
+
+        let queueKey = Data(dashboard.stateDir.utf8).base64EncodedString()
+        let startKey = "schedulex.notificationStart." + queueKey
+        // Establish a first-launch baseline without replaying the existing task history.
+        if defaults.object(forKey: startKey) == nil {
+            defaults.set(dashboard.checkedAt, forKey: startKey)
+        }
+        let since = defaults.double(forKey: startKey)
+        var settings = await center.notificationSettings()
+        if settings.authorizationStatus == .notDetermined {
+            do {
+                _ = try await center.requestAuthorization(options: [.alert, .sound])
+            } catch {
+                return
+            }
+            settings = await center.notificationSettings()
+        }
+        guard settings.authorizationStatus == .authorized ||
+                settings.authorizationStatus == .provisional else { return }
+
+        await syncCompletions(dashboard, key: queueKey, since: since)
+        let now = Date()
+        var targets: [String: NotificationTarget] = [:]
+        for job in dashboard.jobs where job.status == "pending" && job.resetKnown != false && job.due > now.timeIntervalSince1970 {
+            let due = Date(timeIntervalSince1970: job.due)
+            let fireAt = max(now.addingTimeInterval(1), due.addingTimeInterval(-leadTime))
+            targets["task-\(job.id)"] = NotificationTarget(
+                fireAt: fireAt,
+                eventAt: job.due,
+                title: "Scheduled task coming up",
+                body: "Schedulex is scheduled to start a task at \(due.formatted(date: .omitted, time: .shortened))."
+            )
+        }
+
+        if let usage = dashboard.usage {
+            for window in usage.windows {
+                guard let reset = window.resetsAt, reset > now.timeIntervalSince1970 else { continue }
+                let resetDate = Date(timeIntervalSince1970: reset)
+                let fireAt = max(now.addingTimeInterval(1), resetDate.addingTimeInterval(-leadTime))
+                let bucket = window.bucket == "codex" ? "Codex" : window.bucket
+                targets["reset-\(window.id)"] = NotificationTarget(
+                    fireAt: fireAt,
+                    eventAt: reset,
+                    title: "\(bucket) \(window.title) reset coming up",
+                    body: "Expected usage reset at \(resetDate.formatted(date: .omitted, time: .shortened))."
+                )
+            }
+        }
+
+        var signatures = defaults.dictionary(forKey: storageKey) as? [String: String] ?? [:]
+        let identifiers = Set(signatures.keys).union(targets.keys)
+        for identifier in identifiers {
+            guard let target = targets[identifier] else {
+                // Keep reset reminders while Codex usage is temporarily unavailable.
+                if identifier.hasPrefix("reset-"), dashboard.usage == nil { continue }
+                center.removePendingNotificationRequests(withIdentifiers: [identifier])
+                center.removeDeliveredNotifications(withIdentifiers: [identifier])
+                signatures.removeValue(forKey: identifier)
+                continue
+            }
+            guard signatures[identifier] != target.signature else { continue }
+
+            center.removePendingNotificationRequests(withIdentifiers: [identifier])
+            center.removeDeliveredNotifications(withIdentifiers: [identifier])
+            let content = UNMutableNotificationContent()
+            content.title = target.title
+            content.body = target.body
+            content.sound = .default
+            let interval = max(1, target.fireAt.timeIntervalSinceNow)
+            let request = UNNotificationRequest(
+                identifier: identifier,
+                content: content,
+                trigger: UNTimeIntervalNotificationTrigger(timeInterval: interval, repeats: false)
+            )
+            do {
+                try await center.add(request)
+                signatures[identifier] = target.signature
+            } catch {
+                signatures.removeValue(forKey: identifier)
+            }
+        }
+        defaults.set(signatures, forKey: storageKey)
+    }
+}
+
+enum TaskSchedule: Hashable, Sendable {
+    case at
+    case fiveHourReset
+    case weeklyReset
 }
 
 struct TaskDraft: Sendable {
     let prompt: String
     let workspace: String
     let date: Date
-    let afterReset: Bool
+    let schedule: TaskSchedule
     let allowEdits: Bool
     let overnight: Bool
     let idleOnly: Bool
@@ -78,6 +275,18 @@ struct TaskDraft: Sendable {
     let effort: String
     let cloud: Bool
     let cloudEnvironment: String
+    var repeatReset: String? = nil
+    var editingID: String? = nil
+    var revision: Int? = nil
+    var allowedWindow: String = "23:00-07:00"
+    var timezone: String = TimeZone.current.identifier
+    var idleMinutes: Int = 15
+    var limitId: String = "codex"
+    var minRemaining: Double = 1
+    var timeout: Int = 7200
+    var originalSchedule: TaskSchedule? = nil
+    var originalDate: Date? = nil
+    var originalRecurrence: String? = nil
 
     func arguments(promptFile: String) throws -> [String] {
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -87,27 +296,47 @@ struct TaskDraft: Sendable {
         if !cloud {
             var isDirectory: ObjCBool = false
             guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
-                throw NSError(domain: "Schedulex", code: 1, userInfo: [NSLocalizedDescriptionKey: "Choose an existing workspace folder."])
+                throw NSError(domain: "Schedulex", code: 1, userInfo: [NSLocalizedDescriptionKey: "Choose an existing Codex project folder."])
             }
         } else if cloudEnvironment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             throw NSError(domain: "Schedulex", code: 1, userInfo: [NSLocalizedDescriptionKey: "Enter a Codex Cloud environment ID."])
         }
-        if !afterReset && date <= Date() {
+        let keepSchedule = editingID != nil && originalRecurrence == nil && originalSchedule == schedule &&
+            (schedule != .at || date == originalDate)
+        if schedule == .at && repeatReset == nil && !keepSchedule && date <= Date() {
             throw NSError(domain: "Schedulex", code: 1, userInfo: [NSLocalizedDescriptionKey: "Choose a future date and time."])
         }
-        var args = ["add", "--prompt-file", promptFile]
+        var args = editingID.map { ["edit", $0] } ?? ["add"]
+        args += ["--prompt-file", promptFile, "--limit-id", limitId,
+                 "--min-remaining", String(minRemaining), "--timeout", String(timeout)]
+        if let revision, editingID != nil { args += ["--revision", String(revision)] }
         if cloud {
             args += ["--cloud-env", cloudEnvironment.trimmingCharacters(in: .whitespacesAndNewlines)]
         } else {
-            args += ["--cwd", path, "--sandbox", allowEdits ? "workspace-write" : "read-only"]
+            args += ["--project", path]
+            if editingID != nil { args += ["--local"] }
         }
-        args += afterReset ? ["--after-reset"] : ["--at", ISO8601DateFormatter().string(from: date)]
-        if overnight { args += ["--window", "23:00-07:00", "--timezone", TimeZone.current.identifier] }
-        if idleOnly { args += ["--idle-minutes", "15"] }
+        args += ["--sandbox", allowEdits ? "workspace-write" : "read-only"]
+        if let repeatReset {
+            args += ["--repeat-reset", repeatReset]
+        } else if !keepSchedule {
+            switch schedule {
+            case .at: args += ["--at", ISO8601DateFormatter().string(from: date)]
+            case .fiveHourReset: args += ["--after-reset"]
+            case .weeklyReset: args += ["--after-weekly-reset"]
+            }
+        }
+        args += ["--timezone", timezone]
+        if overnight { args += ["--window", allowedWindow] }
+        else if editingID != nil { args += ["--clear-window"] }
+        if idleOnly { args += ["--idle-minutes", String(idleMinutes)] }
+        else if editingID != nil { args += ["--clear-idle"] }
         let selectedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
         let selectedEffort = effort.trimmingCharacters(in: .whitespacesAndNewlines)
         if !selectedModel.isEmpty { args += ["--model", selectedModel] }
+        else if editingID != nil { args += ["--clear-model"] }
         if !selectedEffort.isEmpty { args += ["--effort", selectedEffort] }
+        else if editingID != nil { args += ["--clear-effort"] }
         return args
     }
 }
@@ -175,7 +404,19 @@ final class MenuModel {
     var draftCloudEnvironment = ""
     var draftWorkspace = FileManager.default.homeDirectoryForCurrentUser.path
     var draftDate = Date().addingTimeInterval(3600)
-    var draftAfterReset = false
+    var draftSchedule: TaskSchedule = .at
+    var draftRecurrence = ""
+    var editingID: String?
+    var editingRevision: Int?
+    var editingSchedule: TaskSchedule?
+    var editingDate: Date?
+    var editingRecurrence: String?
+    var draftWindow = "23:00-07:00"
+    var draftTimezone = TimeZone.current.identifier
+    var draftIdleMinutes = 15
+    var draftLimitId = "codex"
+    var draftMinRemaining: Double = 1
+    var draftTimeout = 7200
     var draftAllowEdits = false
     var draftOvernight = false
     var draftIdleOnly = false
@@ -187,6 +428,7 @@ final class MenuModel {
     var draftError: String?
     var queuedMessage: String?
     private let config: Configuration?
+    private let notifications = NotificationCoordinator()
 
     init() {
         do { config = try Configuration.load() }
@@ -194,7 +436,7 @@ final class MenuModel {
     }
 
     func refresh() async {
-        guard !busy, !composing, let config else { return }
+        guard !busy, let config else { return }
         busy = true
         defer { busy = false }
         do {
@@ -202,14 +444,15 @@ final class MenuModel {
                 try JSONDecoder().decode(Dashboard.self, from: Bridge.run(config, ["dashboard"]))
             }.value
             dashboard = value
-            // Local diagnostics let the CLI verify the app's own refresh pipeline.
-            try? JSONEncoder().encode(value).write(
-                to: URL(fileURLWithPath: config.stateDir).appendingPathComponent("menubar-status.json"), options: .atomic)
             error = value.usageError
             if let current = value.usage {
                 usage = current
                 usageUpdated = Date(timeIntervalSince1970: value.checkedAt)
             }
+            // Local diagnostics let the CLI verify the app's own refresh pipeline.
+            try? JSONEncoder().encode(value).write(
+                to: URL(fileURLWithPath: config.stateDir).appendingPathComponent("menubar-status.json"), options: .atomic)
+            Task { await notifications.sync(value) }
         } catch { self.error = error.localizedDescription }
     }
 
@@ -227,20 +470,90 @@ final class MenuModel {
         }
     }
 
+    func beginEditing(_ job: ScheduledJob) {
+        guard !busy, job.status == "pending" else { return }
+        editingID = job.id
+        editingRevision = job.revision
+        draftPrompt = job.prompt
+        draftCloud = job.destination == "cloud"
+        draftCloudEnvironment = job.cloudEnv ?? ""
+        draftWorkspace = job.cwd ?? FileManager.default.homeDirectoryForCurrentUser.path
+        draftDate = max(Date(timeIntervalSince1970: job.due), Date().addingTimeInterval(60))
+        draftSchedule = job.schedule == "after-reset" ? .fiveHourReset : (job.schedule == "after-weekly-reset" ? .weeklyReset : .at)
+        draftRecurrence = job.recurrence ?? ""
+        editingSchedule = draftSchedule
+        editingDate = Date(timeIntervalSince1970: job.due)
+        editingRecurrence = job.recurrence
+        draftAllowEdits = job.sandbox == "workspace-write"
+        draftOvernight = job.window != nil
+        draftWindow = job.window ?? "23:00-07:00"
+        draftTimezone = job.timezone ?? TimeZone.current.identifier
+        let idleMinutes = job.idleMinutes ?? 0
+        draftIdleOnly = idleMinutes > 0
+        draftIdleMinutes = idleMinutes > 0 ? idleMinutes : 15
+        draftLimitId = job.limitId ?? "codex"
+        draftMinRemaining = job.minRemaining ?? 1
+        draftTimeout = job.timeout ?? 7200
+        draftModel = job.model ?? ""
+        draftEffort = job.effort ?? ""
+        draftError = nil
+        queuedMessage = nil
+        composing = true
+    }
+
+    func leaveComposer() {
+        composing = false
+        if editingID != nil { clearDraft() }
+    }
+
+    private func clearDraft() {
+        editingID = nil
+        editingRevision = nil
+        editingSchedule = nil
+        editingDate = nil
+        editingRecurrence = nil
+        draftPrompt = ""
+        draftRecurrence = ""
+        draftSchedule = .at
+        draftCloud = false
+        draftCloudEnvironment = ""
+        draftWorkspace = FileManager.default.homeDirectoryForCurrentUser.path
+        draftDate = Date().addingTimeInterval(3600)
+        draftAllowEdits = false
+        draftOvernight = false
+        draftIdleOnly = false
+        draftModel = ""
+        draftEffort = ""
+        draftWindow = "23:00-07:00"
+        draftTimezone = TimeZone.current.identifier
+        draftIdleMinutes = 15
+        draftLimitId = "codex"
+        draftMinRemaining = 1
+        draftTimeout = 7200
+    }
+
     func queueDraft() async {
         guard !busy, let config else { return }
         let draft = TaskDraft(prompt: draftPrompt, workspace: draftWorkspace, date: draftDate,
-                              afterReset: draftAfterReset, allowEdits: draftAllowEdits,
+                              schedule: draftSchedule, allowEdits: draftAllowEdits,
                               overnight: draftOvernight, idleOnly: draftIdleOnly,
                               model: draftModel, effort: draftEffort, cloud: draftCloud,
-                              cloudEnvironment: draftCloudEnvironment)
+                              cloudEnvironment: draftCloudEnvironment,
+                              repeatReset: draftRecurrence.isEmpty ? nil : draftRecurrence,
+                              editingID: editingID, revision: editingRevision,
+                              allowedWindow: draftWindow, timezone: draftTimezone,
+                              idleMinutes: draftIdleMinutes, limitId: draftLimitId,
+                              minRemaining: draftMinRemaining, timeout: draftTimeout,
+                              originalSchedule: editingSchedule, originalDate: editingDate,
+                              originalRecurrence: editingRecurrence)
         busy = true
         draftError = nil
         do {
             try await Task.detached { try Bridge.queue(config, draft) }.value
-            draftPrompt = ""
+            let edited = editingID != nil
+            clearDraft()
             composing = false
-            queuedMessage = "Task queued.\(dashboard?.workerRunning == true ? "" : " Start the worker to run it.")"
+            queuedMessage = "Task \(edited ? "updated" : "queued").\(dashboard?.workerRunning == true ? "" : " Start the worker to run it.")"
             busy = false
             await refresh()
         } catch {
@@ -306,6 +619,7 @@ struct JobView: View {
     let job: ScheduledJob
     let busy: Bool
     let cancel: () -> Void
+    var edit: (() -> Void)? = nil
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(alignment: .top) {
@@ -315,7 +629,12 @@ struct JobView: View {
                 Text(job.status.capitalized).font(.caption)
                     .foregroundStyle(job.status == "failed" || job.status == "interrupted" ? .orange : .secondary)
             }
-            Text(dateLabel(job.due)).font(.caption).foregroundStyle(.secondary)
+            Text(job.resetKnown == false ? "Waiting for the next reported reset" : dateLabel(job.due))
+                .font(.caption).foregroundStyle(.secondary)
+            if let recurrence = job.recurrence {
+                Label(recurrence == "weekly" ? "Every weekly reset" : "Every five-hour reset", systemImage: "repeat")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             if let environment = job.cloudEnv {
                 Text("Codex Cloud · \(environment)").font(.caption).foregroundStyle(.secondary)
             }
@@ -338,14 +657,20 @@ struct JobView: View {
                 if let cloudUrl = job.cloudUrl, let url = URL(string: cloudUrl) {
                     Link("Open Cloud task", destination: url)
                 } else if let cwd = job.cwd, !cwd.isEmpty {
-                    Button("Workspace") { NSWorkspace.shared.open(URL(fileURLWithPath: cwd)) }
+                    Button("Project folder") { NSWorkspace.shared.open(URL(fileURLWithPath: cwd)) }
+                }
+                if let codexUrl = job.codexUrl, let url = URL(string: codexUrl) {
+                    Link("Open in Codex", destination: url)
                 }
                 if FileManager.default.fileExists(atPath: job.runs) {
                     Button("Results") { NSWorkspace.shared.open(URL(fileURLWithPath: job.runs)) }
                 }
                 Spacer()
                 if job.status == "pending" {
+                    if let edit { Button("Edit", action: edit).disabled(busy) }
                     Button("Cancel", role: .destructive, action: cancel).disabled(busy)
+                } else if job.canInterrupt == true {
+                    Button("Interrupt", role: .destructive, action: cancel).disabled(busy)
                 }
             }.font(.caption).buttonStyle(.borderless)
         }
@@ -355,13 +680,14 @@ struct JobView: View {
 
 struct TaskComposer: View {
     @Bindable var model: MenuModel
+    @State private var showingProjectPicker = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Queue a task").font(.headline)
+                Text(model.editingID == nil ? "Queue a task" : "Edit task").font(.headline)
                 Spacer()
-                Button("Back") { model.composing = false }.disabled(model.busy)
+                Button("Back") { model.leaveComposer() }.disabled(model.busy)
             }
             Text("Prompt").font(.subheadline).fontWeight(.medium)
             TextEditor(text: $model.draftPrompt)
@@ -379,21 +705,14 @@ struct TaskComposer: View {
                 Text("Find configured environments with `codex cloud`. Tasks run in the selected environment’s GitHub repositories.")
                     .font(.caption).foregroundStyle(.secondary)
             } else {
-                Text("Workspace").font(.subheadline).fontWeight(.medium)
+                Text("Codex project").font(.subheadline).fontWeight(.medium)
                 HStack {
-                    TextField("Folder path", text: $model.draftWorkspace)
-                        .textFieldStyle(.roundedBorder).accessibilityLabel("Workspace folder")
-                    Button("Choose…") {
-                        let panel = NSOpenPanel()
-                        panel.canChooseDirectories = true
-                        panel.canChooseFiles = false
-                        panel.allowsMultipleSelection = false
-                        panel.prompt = "Choose workspace"
-                        panel.begin { response in
-                            if response == .OK, let url = panel.url { model.draftWorkspace = url.path }
-                        }
-                    }
+                    TextField("Project folder path", text: $model.draftWorkspace)
+                        .textFieldStyle(.roundedBorder).accessibilityLabel("Codex project folder")
+                    Button("Choose…") { showingProjectPicker = true }
                 }
+                Text("The selected folder is the task’s project context and working directory.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             HStack {
                 Text("Model").frame(width: 50, alignment: .leading)
@@ -424,35 +743,60 @@ struct TaskComposer: View {
             if let message = model.catalogError {
                 Text(message).font(.caption).foregroundStyle(.secondary)
             }
-            Picker("Schedule", selection: $model.draftAfterReset) {
-                Text("At a time").tag(false)
-                Text("After 5-hour reset").tag(true)
-            }.pickerStyle(.segmented)
-            if model.draftAfterReset {
-                Text("Uses your next reported reset time and waits for available allowance.")
+            Picker("Repeat", selection: $model.draftRecurrence) {
+                Text("Once").tag("")
+                Text("Every 5-hour reset").tag("five-hour")
+                Text("Every weekly reset").tag("weekly")
+            }
+            if !model.draftRecurrence.isEmpty {
+                Text("Starts after each reported usage reset. Failed or interrupted runs stop recurrence for review.")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+            Picker("Schedule", selection: $model.draftSchedule) {
+                Text("At a time").tag(TaskSchedule.at)
+                Text("After 5-hour reset").tag(TaskSchedule.fiveHourReset)
+                Text("After weekly reset").tag(TaskSchedule.weeklyReset)
+            }.pickerStyle(.menu)
+            if model.draftSchedule != .at {
+                Text(model.draftSchedule == .weeklyReset
+                     ? "Uses your next reported weekly reset time and waits for available allowance."
+                     : "Uses your next reported five-hour reset time and waits for available allowance.")
                     .font(.caption).foregroundStyle(.secondary)
             } else {
                 DatePicker("Run at", selection: $model.draftDate, in: Date()...,
                            displayedComponents: [.date, .hourAndMinute])
                 Text("Time zone: \(TimeZone.current.identifier)").font(.caption).foregroundStyle(.secondary)
             }
-            if !model.draftCloud {
-                Toggle("Allow edits in this workspace", isOn: $model.draftAllowEdits)
             }
-            Toggle("Only start overnight (23:00–07:00)", isOn: $model.draftOvernight)
-            Toggle("Wait for 15 minutes of keyboard/mouse inactivity", isOn: $model.draftIdleOnly)
+            if !model.draftCloud {
+                Toggle("Allow edits in this project", isOn: $model.draftAllowEdits)
+            }
+            Toggle("Only start during \(model.draftWindow) (\(model.draftTimezone))", isOn: $model.draftOvernight)
+            Toggle("Wait for \(model.draftIdleMinutes) minute\(model.draftIdleMinutes == 1 ? "" : "s") of keyboard/mouse inactivity", isOn: $model.draftIdleOnly)
             if let error = model.draftError {
                 Text(error).font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
             }
             HStack {
                 if model.busy { ProgressView().controlSize(.small) }
                 Spacer()
-                Button(model.draftCloud ? "Queue Cloud task" : "Queue task") { Task { await model.queueDraft() } }
+                Button(model.editingID != nil ? "Save changes" : (model.draftCloud ? "Queue Cloud task" : "Queue task")) { Task { await model.queueDraft() } }
                     .buttonStyle(.borderedProminent)
                     .disabled(model.busy || model.draftPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
                               (model.draftCloud && model.draftCloudEnvironment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
             }
         }.padding(16).frame(width: 410).disabled(model.busy)
+            .fileImporter(isPresented: $showingProjectPicker,
+                          allowedContentTypes: [.folder],
+                          allowsMultipleSelection: false) { result in
+                switch result {
+                case .success(let urls):
+                    if let url = urls.first { model.draftWorkspace = url.path }
+                case .failure(let error):
+                    if (error as? CocoaError)?.code != .userCancelled {
+                        model.draftError = error.localizedDescription
+                    }
+                }
+            }
             .task { await model.loadModels() }
     }
 }
@@ -536,12 +880,14 @@ struct MenuPanel: View {
                     Text("SCHEDULED TASKS · \(active.count)").font(.caption).foregroundStyle(.secondary)
                     if active.isEmpty { Text("No scheduled tasks").foregroundStyle(.secondary) }
                     ForEach(active) { job in
-                        JobView(job: job, busy: model.busy) { Task { await model.perform(["cancel", job.id]) } }
+                        JobView(job: job, busy: model.busy,
+                                cancel: { Task { await model.perform([job.status == "running" ? "interrupt" : "cancel", job.id]) } },
+                                edit: { model.beginEditing(job) })
                     }
                     if !recent.isEmpty {
                         Text("RECENT TASKS").font(.caption).foregroundStyle(.secondary)
                         ForEach(recent) { job in
-                            JobView(job: job, busy: model.busy) { }
+                            JobView(job: job, busy: model.busy, cancel: {})
                         }
                     }
                 }.frame(maxWidth: .infinity, alignment: .leading)

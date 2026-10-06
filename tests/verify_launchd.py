@@ -1,4 +1,5 @@
 """macOS integration check: temporary LaunchAgent and fake Codex, no inference."""
+import json
 import os
 from pathlib import Path
 import plistlib
@@ -45,7 +46,9 @@ def main():
             if row["status"] != "succeeded":
                 log = root / "stderr.log"
                 raise RuntimeError(f"Service test failed: {row}; {log.read_text() if log.exists() else 'no log'}")
-            assert (store.root / "runs" / job / "received.txt").read_text() == "scheduled launchd test\n"
+            events = [json.loads(line) for line in (store.root / "runs" / job / "events.jsonl").read_text().splitlines()]
+            transport = next(e["params"] for e in events if e.get("method") == "fixture/transport")
+            assert transport["turn"]["input"][0]["text"] == "scheduled launchd test\n"
             print("PASS: launchd started the worker and executed a future queued prompt")
         finally:
             if loaded:
