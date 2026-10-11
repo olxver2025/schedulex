@@ -317,7 +317,7 @@ def main(argv=None):
             row = store.get(args.id)
             if row["status"] != "running" or not row.get("thread_id") or not row.get("turn_id"):
                 raise ValueError("This task does not have a running local Codex turn")
-            codex.interrupt(codex.executable(args.codex), row["thread_id"], row["turn_id"])
+            codex.interrupt_job(codex.executable(args.codex), store, row)
             print("Interruption requested; the worker will record the final status")
         elif args.command == "cancel":
             store.cancel(args.id)

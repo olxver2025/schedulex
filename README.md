@@ -119,14 +119,16 @@ The default sandbox is read-only. Add `--sandbox workspace-write` to authorize
 project edits. `--project PATH` (also available as `--cwd PATH`) selects the local
 Codex project folder and is saved with the scheduled task. That folder is the task's
 project context and working directory. Local
-tasks run on Codex’s shared app-server daemon, load that project's instructions, and
-appear as persistent chats in the Codex app. Use **Open in Codex** on a task card to
-review saved history or continue the chat after completion. Use **Interrupt** in
-Schedulex or `schx interrupt JOB_ID` to stop a running turn. Some desktop versions
-use a separate server and cannot control daemon-owned runs with their stop button.
-This uses
-the experimental Codex App Server interface, so a current Codex CLI with
-`app-server daemon start` and `app-server proxy` support is required. Schedulex
+tasks run on a dedicated Codex app-server, load that project's instructions, and
+appear as persistent chats in the Codex app. Schedulex stops the task's server
+before reporting completion, releasing the conversation so the desktop can resume
+it immediately. Use **Open in Codex** on a finished task card to review saved history
+or continue the chat. While a task is running, use **Results** to inspect its output
+or **Interrupt** (`schx interrupt JOB_ID`) to stop it. The desktop cannot take over
+a conversation while a separate server is running it, so **Open in Codex** becomes
+available after the run ends. This uses the experimental Codex App Server interface,
+so a current Codex CLI with Unix socket transport and `app-server proxy --sock`
+support is required. Schedulex
 reports connection failures instead of falling back to an invisible run.
 
 Every run is noninteractive with approval policy `never`; commands
@@ -279,7 +281,7 @@ retried because they may already have changed files. Review the workspace and lo
 then enqueue a new task if needed. Pending jobs can be cancelled. To interrupt an
 active job, stop the foreground worker with Ctrl-C or uninstall its background
 service, click **Interrupt** in Schedulex, or run `schx interrupt JOB_ID`. SIGTERM/Ctrl-C request
-`turn/interrupt` on the shared server before closing the worker connection. An abrupt kill or power
+`turn/interrupt` on the task's server before stopping it. An abrupt kill or power
 loss marks a running job interrupted at the next worker startup; child processes
 can survive an abrupt worker kill, so inspect processes before scheduling again.
 

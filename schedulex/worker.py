@@ -87,7 +87,10 @@ def execute(store, binary, row):
     try:
         logs = store.root / "runs" / row["id"]
         logs.mkdir(parents=True, exist_ok=True, mode=0o700)
-        server = codex.AppServer(binary, shared=True)
+        # A persistent daemon keeps the rollout writer locked after proxy exit.
+        # Own this server so completion releases it before the desktop resumes.
+        server = codex.AppServer(binary, owned=True)
+        (logs / "server.json").write_text(json.dumps({"socket": server.socket_path}))
         if sys.platform == "darwin":
             awake_guard = subprocess.Popen(["/usr/bin/caffeinate", "-i", "-w", str(server.process.pid)],
                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -128,6 +131,9 @@ def execute(store, binary, row):
                 if event.get("method") == "turn/completed" and params.get("turn", {}).get("id") == turn_id:
                     status = params["turn"]["status"]
                     outcome = {"completed": "succeeded", "interrupted": "interrupted"}.get(status, "failed")
+                    server.close()
+                    server = None
+                    (logs / "server.json").unlink(missing_ok=True)
                     store.finish(row["id"], outcome, 0 if outcome == "succeeded" else None,
                                  "" if outcome == "succeeded" else "Review the Codex chat before scheduling again")
                     print(f"{row['id']}: {outcome}; Codex chat {thread_id}", flush=True)
@@ -135,7 +141,7 @@ def execute(store, binary, row):
     except BaseException as error:
         if server is not None and thread_id is not None:
             try:
-                # The daemon owns the turn: killing the proxy alone would leave it running.
+                # Interrupt before stopping the server, including uncertain turn starts.
                 if turn_id is None:
                     turns = server.request("thread/read", {"threadId": thread_id, "includeTurns": True}, timeout=10)["thread"].get("turns", [])
                     if turns:
@@ -144,6 +150,11 @@ def execute(store, binary, row):
                     server.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id}, timeout=10)
             except (codex.CodexError, OSError, TimeoutError):
                 pass
+        if server is not None:
+            server.close()
+            server = None
+        if 'logs' in locals():
+            (logs / "server.json").unlink(missing_ok=True)
         store.finish(row["id"], "interrupted", note=f"Task stopped: {error}; review the Codex chat before retrying")
         if not isinstance(error, (TimeoutError, codex.CodexError, OSError)):
             raise
@@ -279,7 +290,7 @@ def run(store, binary, once=False, interval=60):
             if row["status"] == "running":
                 if row.get("thread_id") and row.get("turn_id"):
                     try:
-                        codex.interrupt(binary, row["thread_id"], row["turn_id"])
+                        codex.interrupt_job(binary, store, row)
                     except (codex.CodexError, OSError, TimeoutError) as error:
                         print(f"Could not interrupt previous Codex turn: {error}", flush=True)
                 store.finish(row["id"], "interrupted", note="Previous worker stopped; review workspace and logs")

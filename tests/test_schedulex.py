@@ -117,6 +117,25 @@ class SchedulerTests(unittest.TestCase):
         self.assertNotIn("model_reasoning_effort", transport["thread"]["config"])
         self.assertIsNone(transport["turn"]["effort"])
 
+    def test_owned_server_releases_process_and_socket(self):
+        trace = self.root / "owned-rpc.jsonl"
+        with patch.dict(os.environ, {"FAKE_RPC_LOG": str(trace)}):
+            server = codex.AppServer(str(self.fake), owned=True)
+        owner = server.owner
+        socket_path = Path(server.socket_path)
+        try:
+            self.assertIsNone(owner.poll())
+            self.assertTrue(socket_path.exists())
+            with patch.dict(os.environ, {"FAKE_RPC_LOG": str(trace)}):
+                codex.interrupt(str(self.fake), "fixture-thread", "fixture-turn",
+                                socket_path=server.socket_path)
+            self.assertTrue(any(json.loads(line)["method"] == "turn/interrupt"
+                                for line in trace.read_text().splitlines()))
+        finally:
+            server.close()
+        self.assertIsNotNone(owner.poll())
+        self.assertFalse(socket_path.parent.exists())
+
     def test_cli_model_and_effort_are_saved(self):
         with contextlib.redirect_stdout(io.StringIO()):
             main(["--state-dir", str(self.store.root), "add", "--at", "+2h",
@@ -155,6 +174,7 @@ class SchedulerTests(unittest.TestCase):
         interruption = next(r for r in requests if r["method"] == "turn/interrupt")
         self.assertEqual(interruption["params"], {"threadId": "fixture-thread", "turnId": "fixture-turn"})
         self.assertEqual(self.store.get(job)["status"], "interrupted")
+        self.assertFalse((self.store.root / "runs" / job / "server.json").exists())
         self.assertFalse(tick(self.store, str(self.fake)))
 
     def test_external_interruption_status_and_cli(self):

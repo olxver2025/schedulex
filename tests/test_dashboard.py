@@ -63,6 +63,21 @@ class DashboardTests(unittest.TestCase):
             self.assertTrue(worker_running(self.store))
         self.assertFalse(worker_running(self.store))
 
+    def test_codex_handoff_only_after_run_ends(self):
+        job = self.store.add({"prompt": "test", "cwd": self.temp.name}, 123)
+        self.store.claim(job)
+        self.store.set_thread(job, "test-thread")
+        self.store.set_turn(job, "test-turn")
+        with patch("schedulex.codex.executable", return_value="fake"), \
+                patch("schedulex.codex.snapshot", return_value=self.snapshot()):
+            active = dashboard(self.store, "fake")["jobs"][0]
+            self.assertIsNone(active["codexUrl"])
+            self.assertTrue(active["canInterrupt"])
+            self.assertIn("after this run ends", active["note"])
+            self.store.finish(job, "succeeded")
+            complete = dashboard(self.store, "fake")["jobs"][0]
+            self.assertEqual(complete["codexUrl"], "codex://threads/test-thread")
+
     def test_all_active_jobs_and_only_recent_terminal_history(self):
         for index in range(15):
             job = self.store.add({"prompt": f"old {index}", "cwd": self.temp.name}, index)

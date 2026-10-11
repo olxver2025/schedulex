@@ -131,6 +131,32 @@ behavior relied on persistent jobs being checked when the worker next ran.
 
 ## Codex chat visibility, 6 October 2026
 
+### Ownership handoff correction
+
+- Replaced daemon-owned local runs with a dedicated server per run. Completion,
+  failure, and normal interruption stop that server before publishing the terminal
+  job status, releasing the persisted conversation writer. Interrupt requests use
+  the run's private Unix socket; legacy runs retain their daemon interruption path.
+- Running cards explain that opening in Codex is available after the run ends.
+  Finished cards and completion notifications retain the original conversation ID.
+- A real read-only worker run completed, then a separate app-server immediately
+  resumed its saved conversation without a writer conflict. Verified conversation:
+  `01a111a8-706b-77f1-beee-9ac6f7a68f33`. No project files were changed by that run.
+- The current desktop still cannot take ownership while an external run is active.
+  This change fixes the completed-run handoff; it does not make external live runs
+  native desktop tasks. No desktop restart or daemon-wide stop was performed.
+- 57 regression tests pass, including per-run socket interruption, server cleanup,
+  and hiding the desktop link until completion. `git diff --check` passes.
+- Applied the four changed Python modules and README to the installed runtime,
+  with a backup in `/tmp/schx-runtime-backup-*`. Restarted the idle worker and
+  verified its running launchd state, matching source bytes, and preserved queue.
+- Checked the existing completed task `01a111a2-24dd-71f2-8399-99d897eb3e18`:
+  the desktop now reports it as idle and holds its rollout, so its current writer
+  is the desktop itself. A separate-server resume correctly fails while the
+  desktop owns it. A targeted archive attempt also failed without changing it.
+
+The earlier shared-daemon verification below describes the superseded approach.
+
 - Local dispatch now uses the shared Codex app-server daemon through the CLI proxy,
   with a verified WebSocket upgrade and masked client frames. Chats persist with
   `threadSource=user`; job records retain thread and turn IDs. Existing queue

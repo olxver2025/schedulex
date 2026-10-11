@@ -3,11 +3,60 @@
 import base64
 import hashlib
 import struct
+import socket
+import selectors
+import signal
 import json
 import os
 from pathlib import Path
 import sys
 import time
+
+if "--sock" in sys.argv:
+    connection = socket.socket(socket.AF_UNIX)
+    connection.connect(sys.argv[sys.argv.index("--sock") + 1])
+    selector = selectors.DefaultSelector()
+    selector.register(sys.stdin.buffer, selectors.EVENT_READ)
+    selector.register(connection, selectors.EVENT_READ)
+    while True:
+        for key, _ in selector.select():
+            if key.fileobj is connection:
+                data = connection.recv(65536)
+                if not data:
+                    sys.exit(0)
+                sys.stdout.buffer.write(data)
+                sys.stdout.buffer.flush()
+            else:
+                data = os.read(sys.stdin.fileno(), 65536)
+                if not data:
+                    sys.exit(0)
+                connection.sendall(data)
+
+if "--listen" in sys.argv:
+    def shutdown(signum, frame):
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.killpg(os.getpgrp(), signal.SIGTERM)
+    signal.signal(signal.SIGTERM, shutdown)
+    listener = socket.socket(socket.AF_UNIX)
+    listener.bind(sys.argv[sys.argv.index("--listen") + 1].removeprefix("unix://"))
+    listener.listen()
+    while True:
+        connection, _ = listener.accept()
+        child = os.fork()
+        if child == 0:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            listener.close()
+            sys.stdin = connection.makefile("r")
+            sys.stdout = connection.makefile("w")
+            sys.argv.append("proxy")
+            break
+        connection.close()
+        while True:
+            try:
+                if os.waitpid(-1, os.WNOHANG)[0] == 0:
+                    break
+            except ChildProcessError:
+                break
 
 mode = os.environ.get("FAKE_MODE", "success")
 if "daemon" in sys.argv:

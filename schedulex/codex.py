@@ -6,8 +6,11 @@ import json
 import os
 import selectors
 import shutil
+import stat
 import subprocess
+import tempfile
 import time
+from pathlib import Path
 
 
 class CodexError(Exception):
@@ -28,16 +31,41 @@ def executable(value="codex"):
 
 
 class AppServer:
-    def __init__(self, binary, shared=False):
-        if shared:
+    def __init__(self, binary, shared=False, socket_path=None, owned=False):
+        self.owner = None
+        self.socket_dir = None
+        self.socket_path = socket_path
+        if owned:
+            self.socket_dir = tempfile.mkdtemp(prefix="schx-", dir="/tmp")
+            self.socket_path = str(Path(self.socket_dir) / "server.sock")
+            self.owner = subprocess.Popen(
+                [binary, "app-server", "--listen", "unix://" + self.socket_path],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True, env=subscription_env())
+            deadline = time.monotonic() + 10
+            while not Path(self.socket_path).exists():
+                if self.owner.poll() is not None or time.monotonic() >= deadline:
+                    self.close_owner()
+                    raise CodexError("Could not start the task's Codex server")
+                time.sleep(0.05)
+            if not stat.S_ISSOCK(Path(self.socket_path).stat().st_mode):
+                self.close_owner()
+                raise CodexError("Invalid task Codex server socket")
+        shared = shared or self.socket_path is not None
+        if shared and self.socket_path is None:
             result = subprocess.run([binary, "app-server", "daemon", "start"],
                                     capture_output=True, text=True, timeout=30, env=subscription_env())
             if result.returncode:
                 raise CodexError("Could not start the shared Codex server: " + result.stderr.strip())
-        self.process = subprocess.Popen(
-            [binary, "app-server"] + (["proxy"] if shared else []), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, start_new_session=True, env=subscription_env(),
-        )
+        try:
+            self.process = subprocess.Popen(
+                [binary, "app-server"] + (["proxy"] if shared else []) +
+                (["--sock", self.socket_path] if self.socket_path else []),
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, start_new_session=True, env=subscription_env())
+        except BaseException:
+            self.close_owner()
+            raise
         self.selector = selectors.DefaultSelector()
         self.selector.register(self.process.stdout, selectors.EVENT_READ)
         self.buffer = b""
@@ -182,19 +210,34 @@ class AppServer:
         return self.read_event(deadline)
 
     def close(self):
-        self.selector.close()
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
         try:
-            self.process.stdin.close()
-        except BrokenPipeError:
-            pass
-        self.process.stdout.close()
+            self.selector.close()
+            if self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
+            try:
+                self.process.stdin.close()
+            except BrokenPipeError:
+                pass
+            self.process.stdout.close()
+        finally:
+            self.close_owner()
+
+    def close_owner(self):
+        if self.owner is not None and self.owner.poll() is None:
+            self.owner.terminate()
+            try:
+                self.owner.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.owner.kill()
+                self.owner.wait()
+        if self.socket_dir is not None:
+            shutil.rmtree(self.socket_dir)
+            self.socket_dir = None
 
 
 def snapshot(binary):
@@ -290,8 +333,8 @@ def allowance(value, limit_id="codex", min_remaining=1):
     return True, "Ready"
 
 
-def interrupt(binary, thread_id, turn_id):
-    server = AppServer(binary, shared=True)
+def interrupt(binary, thread_id, turn_id, socket_path=None):
+    server = AppServer(binary, shared=True, socket_path=socket_path)
     try:
         server.request("initialize", {"clientInfo": {
             "name": "schedulex", "title": "Schedulex", "version": "0.2.0"}})
@@ -299,3 +342,9 @@ def interrupt(binary, thread_id, turn_id):
         server.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id}, timeout=10)
     finally:
         server.close()
+
+
+def interrupt_job(binary, store, row):
+    endpoint = store.root / "runs" / row["id"] / "server.json"
+    socket_path = json.loads(endpoint.read_text())["socket"] if endpoint.exists() else None
+    interrupt(binary, row["thread_id"], row["turn_id"], socket_path=socket_path)

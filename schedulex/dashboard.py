@@ -47,11 +47,14 @@ def dashboard(store, binary):
     for row in active + recent:
         spec = json.loads(row["spec"])
         jobs.append({"id": row["id"], "prompt": spec["prompt"], "status": row["status"],
-                     "due": row["due"], "cwd": spec.get("cwd"), "note": row["note"],
+                     "due": row["due"], "cwd": spec.get("cwd"),
+                     "note": (row["note"] + "\nOpen in Codex is available after this run ends.").strip()
+                             if row["status"] == "running" and row.get("thread_id") else row["note"],
                      "destination": spec.get("destination", "local"),
                      "threadId": row.get("thread_id"),
                      "canInterrupt": row["status"] == "running" and bool(row.get("turn_id")),
-                     "codexUrl": "codex://threads/" + row["thread_id"] if row.get("thread_id") else None,
+                     "codexUrl": "codex://threads/" + row["thread_id"]
+                                 if row.get("thread_id") and row["status"] != "running" else None,
                      "cloudEnv": spec.get("cloud_env"), "cloudUrl": row.get("cloud_url"),
                      "window": spec.get("window"), "timezone": spec.get("timezone"),
                      "sandbox": spec.get("sandbox", "read-only"),
